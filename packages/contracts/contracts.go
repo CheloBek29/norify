@@ -11,6 +11,7 @@ type CampaignProgressEvent struct {
 	Success         int       `json:"success"`
 	Failed          int       `json:"failed"`
 	Cancelled       int       `json:"cancelled"`
+	P95DispatchMs   int       `json:"p95_dispatch_ms"`
 	ProgressPercent float64   `json:"progress_percent"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -41,6 +42,30 @@ type SendMessageRequest struct {
 	MessageBody    string `json:"message_body"`
 	Attempt        int    `json:"attempt"`
 	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type MessageSendResult struct {
+	CampaignID     string    `json:"campaign_id"`
+	UserID         string    `json:"user_id"`
+	ChannelCode    string    `json:"channel_code"`
+	Status         string    `json:"status"`
+	ErrorCode      string    `json:"error_code,omitempty"`
+	ErrorMessage   string    `json:"error_message,omitempty"`
+	Attempt        int       `json:"attempt"`
+	Retryable      bool      `json:"retryable"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	FinishedAt     time.Time `json:"finished_at"`
+}
+
+type WorkerChannelConfig struct {
+	Code               string  `json:"code"`
+	Enabled            bool    `json:"enabled"`
+	SuccessProbability float64 `json:"success_probability"`
+	MinDelaySeconds    int     `json:"min_delay_seconds"`
+	MaxDelaySeconds    int     `json:"max_delay_seconds"`
+	MaxParallelism     int     `json:"max_parallelism"`
+	RetryLimit         int     `json:"retry_limit"`
+	Source             string  `json:"source,omitempty"`
 }
 
 type MessageStatusEvent struct {

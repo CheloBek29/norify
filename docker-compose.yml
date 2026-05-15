@@ -1,3 +1,5 @@
+name: norify
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -16,11 +18,13 @@ services:
       retries: 20
 
   postgres-viewer:
-    image: adminer:4.8.1
-    environment:
-      ADMINER_DEFAULT_SERVER: postgres
+    image: sosedoff/pgweb:latest
+    command:
+      - --bind=0.0.0.0
+      - --listen=8081
+      - --url=postgres://norify:norify@postgres:5432/norify?sslmode=disable
     ports:
-      - "8089:8080"
+      - "8089:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +84,8 @@ services:
     build:
       context: .
       dockerfile: services/template-service/Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
     ports:
       - "8083:8080"
     depends_on:
@@ -173,6 +179,7 @@ services:
         condition: service_healthy
 
   frontend:
+    image: norify-frontend:latest
     build:
       context: ./apps/frontend
     ports:

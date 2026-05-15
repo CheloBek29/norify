@@ -38,6 +38,7 @@ type Campaign struct {
 	CreatedAt        time.Time          `json:"created_at"`
 	StartedAt        *time.Time         `json:"started_at,omitempty"`
 	FinishedAt       *time.Time         `json:"finished_at,omitempty"`
+	ArchivedAt       *time.Time         `json:"archived_at,omitempty"`
 	Snapshot         campaigns.Snapshot `json:"snapshot"`
 }
 
@@ -102,10 +103,10 @@ func listCampaigns(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(r.Context(), `
 		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels,
 		       c.total_recipients, c.total_messages, c.sent_count, c.success_count, c.failed_count, c.cancelled_count,
-		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at
+		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at, c.archived_at
 		FROM campaigns c
 		LEFT JOIN templates t ON t.id = c.template_id
-		ORDER BY c.created_at DESC
+		ORDER BY COALESCE(c.archived_at, c.created_at) DESC, c.created_at DESC
 		LIMIT 100`)
 	if err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -194,6 +195,8 @@ func campaignAction(w http.ResponseWriter, r *http.Request) {
 		stopCampaign(w, r, id)
 	case "cancel":
 		cancelCampaign(w, r, id)
+	case "archive":
+		archiveCampaign(w, r, id)
 	case "retry-failed":
 		retryFailed(w, r, id)
 	case "switch-channel":
@@ -238,6 +241,7 @@ func dispatchMetrics(w http.ResponseWriter, r *http.Request, id string) {
 		writeLookupError(w, err)
 		return
 	}
+	_ = publishCampaignProgress(r.Context(), campaign)
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
 }
 
@@ -289,6 +293,24 @@ func cancelCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		    finished_at = now(),
 		    updated_at = now()
 		WHERE id = $1`, id, campaigns.StatusCancelled)
+	if err != nil {
+		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	campaign, err := getCampaign(r.Context(), id)
+	if err != nil {
+		writeLookupError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, campaign)
+}
+
+func archiveCampaign(w http.ResponseWriter, r *http.Request, id string) {
+	_, err := db.Exec(r.Context(), `
+		UPDATE campaigns
+		SET archived_at = COALESCE(archived_at, now()),
+		    updated_at = now()
+		WHERE id = $1`, id)
 	if err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -713,6 +735,34 @@ func publishGroupStatusEvents(ctx context.Context, campaignID string, rows []fai
 	return nil
 }
 
+func publishCampaignProgress(ctx context.Context, campaign Campaign) error {
+	if mq == nil {
+		return nil
+	}
+	processed := campaign.SuccessCount + campaign.FailedCount + campaign.CancelledCount
+	progress := 0.0
+	if campaign.TotalMessages > 0 {
+		progress = float64(processed) / float64(campaign.TotalMessages) * 100
+		if progress > 100 {
+			progress = 100
+		}
+	}
+	event := contracts.CampaignProgressEvent{
+		Type:            "campaign.progress",
+		CampaignID:      campaign.ID,
+		Status:          campaign.Status,
+		TotalMessages:   campaign.TotalMessages,
+		Processed:       processed,
+		Success:         campaign.SuccessCount,
+		Failed:          campaign.FailedCount,
+		Cancelled:       campaign.CancelledCount,
+		P95DispatchMs:   campaign.P95DispatchMs,
+		ProgressPercent: progress,
+		UpdatedAt:       time.Now().UTC(),
+	}
+	return appruntime.PublishJSON(ctx, mq, appruntime.ExchangeCampaignStatus, "campaign.progress", event)
+}
+
 func campaignTotalMessages(ctx context.Context, campaignID string) int {
 	var total int
 	_ = db.QueryRow(ctx, `SELECT total_messages FROM campaigns WHERE id = $1`, campaignID).Scan(&total)
@@ -741,7 +791,7 @@ func getCampaign(ctx context.Context, id string) (Campaign, error) {
 	row := db.QueryRow(ctx, `
 		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels,
 		       c.total_recipients, c.total_messages, c.sent_count, c.success_count, c.failed_count, c.cancelled_count,
-		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at
+		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at, c.archived_at
 		FROM campaigns c
 		LEFT JOIN templates t ON t.id = c.template_id
 		WHERE c.id = $1`, id)
@@ -755,7 +805,7 @@ func scanCampaign(row pgx.Row) (Campaign, error) {
 		&campaign.ID, &campaign.Name, &campaign.TemplateID, &campaign.TemplateName, &campaign.Status,
 		&campaign.Filters, &selected, &campaign.TotalRecipients, &campaign.TotalMessages,
 		&campaign.SentCount, &campaign.SuccessCount, &campaign.FailedCount, &campaign.CancelledCount,
-		&campaign.P95DispatchMs, &campaign.CreatedAt, &campaign.StartedAt, &campaign.FinishedAt,
+		&campaign.P95DispatchMs, &campaign.CreatedAt, &campaign.StartedAt, &campaign.FinishedAt, &campaign.ArchivedAt,
 	); err != nil {
 		return Campaign{}, err
 	}
@@ -774,7 +824,10 @@ func scanCampaign(row pgx.Row) (Campaign, error) {
 }
 
 func ensureSchema(ctx context.Context) error {
-	_, err := db.Exec(ctx, `ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS p95_dispatch_ms int NOT NULL DEFAULT 0`)
+	_, err := db.Exec(ctx, `
+		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS p95_dispatch_ms int NOT NULL DEFAULT 0;
+		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+		CREATE INDEX IF NOT EXISTS idx_campaigns_active_created_at ON campaigns(created_at DESC) WHERE archived_at IS NULL;`)
 	return err
 }
 
