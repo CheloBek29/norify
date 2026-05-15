@@ -258,6 +258,7 @@ func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err := publishDispatch(r.Context(), campaign); err != nil {
+		_, _ = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = NULL, updated_at = now() WHERE id = $1 AND status = $3`, id, campaigns.StatusCreated, campaigns.StatusRunning)
 		httpapi.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
@@ -827,7 +828,8 @@ func ensureSchema(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS p95_dispatch_ms int NOT NULL DEFAULT 0;
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS archived_at timestamptz;
-		CREATE INDEX IF NOT EXISTS idx_campaigns_active_created_at ON campaigns(created_at DESC) WHERE archived_at IS NULL;`)
+		CREATE INDEX IF NOT EXISTS idx_campaigns_active_created_at ON campaigns(created_at DESC) WHERE archived_at IS NULL;
+		ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_template_id_fkey;`)
 	return err
 }
 

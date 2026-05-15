@@ -171,10 +171,15 @@ async def operations_ws(websocket: WebSocket) -> None:
     try:
         await websocket.send_json({"type": "ops.ready"})
         while True:
-            command = json.loads(await websocket.receive_text())
+            raw = await websocket.receive_text()
+            try:
+                command = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "command.error", "request_id": "", "error": "invalid_json"})
+                continue
             result = await handle_ops_command(command)
             await broadcast_ops(result)
-    except (WebSocketDisconnect, json.JSONDecodeError):
+    except WebSocketDisconnect:
         pass
     finally:
         ops_connections.discard(websocket)
@@ -246,8 +251,18 @@ async def handle_ops_command(command: dict[str, Any]) -> dict[str, Any]:
 
         if command_type == "channel.update":
             code = str(payload.get("code") or "")
-            channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
-            updated = await proxy_json("PATCH", f"{CHANNEL_SERVICE_URL}/channels/{code}", channel)
+            raw = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+            normalized = {
+                "code": raw.get("code") or raw.get("Code") or code,
+                "name": raw.get("name") or raw.get("Name") or code,
+                "enabled": bool(raw.get("enabled") if "enabled" in raw else raw.get("Enabled", True)),
+                "success_probability": float(raw.get("success_probability") or raw.get("successProbability") or raw.get("SuccessProbability") or 0.92),
+                "min_delay_seconds": int(raw.get("min_delay_seconds") or raw.get("minDelaySeconds") or raw.get("MinDelaySeconds") or 2),
+                "max_delay_seconds": int(raw.get("max_delay_seconds") or raw.get("maxDelaySeconds") or raw.get("MaxDelaySeconds") or 300),
+                "max_parallelism": int(raw.get("max_parallelism") or raw.get("maxParallelism") or raw.get("MaxParallelism") or 100),
+                "retry_limit": int(raw.get("retry_limit") or raw.get("retryLimit") or raw.get("RetryLimit") or 3),
+            }
+            updated = await proxy_json("PATCH", f"{CHANNEL_SERVICE_URL}/channels/{code}", normalized)
             return {"type": "channel.upsert", "request_id": request_id, "channel": updated}
 
         if command_type == "template.save":

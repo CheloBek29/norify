@@ -84,9 +84,14 @@ export function App() {
   const [apiState, setApiState] = useState("connecting");
   const opsSocketRef = useRef<WebSocket | null>(null);
   const pendingOpsRef = useRef(new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>());
+  const selectedCampaignIdRef = useRef(selectedCampaignId);
   const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
   const selectedCampaign = activeCampaigns.find((campaign) => campaign.id === selectedCampaignId) ?? activeCampaigns[0] ?? campaigns[0];
   const activeError = selectedCampaign && selectedCampaign.failed > 0 ? buildError(selectedCampaign) : currentError;
+
+  useEffect(() => {
+    selectedCampaignIdRef.current = selectedCampaignId;
+  }, [selectedCampaignId]);
 
   useEffect(() => {
     if (!session) return;
@@ -101,9 +106,11 @@ export function App() {
       fetchTemplateVariables(),
     ]);
     const hasLiveData = [nextCampaigns, nextTemplates, nextChannels, nextTemplateVariables].some((result) => result.status === "fulfilled");
+    let activeCampaignId = "";
     if (nextCampaigns.status === "fulfilled" && nextCampaigns.value.length > 0) {
       setCampaigns(nextCampaigns.value);
-      setSelectedCampaignId((current) => current || nextCampaigns.value.find((campaign) => !campaign.archivedAt)?.id || nextCampaigns.value[0].id);
+      activeCampaignId = nextCampaigns.value.find((campaign) => !campaign.archivedAt)?.id || nextCampaigns.value[0].id;
+      setSelectedCampaignId((current) => current || activeCampaignId);
     }
     if (nextTemplates.status === "fulfilled" && nextTemplates.value.length > 0) setTemplates(nextTemplates.value);
     if (nextTemplateVariables.status === "fulfilled" && nextTemplateVariables.value.length > 0) setTemplateVariables(nextTemplateVariables.value);
@@ -113,35 +120,53 @@ export function App() {
     } else {
       setApiState("local fallback");
     }
+    const idToFetch = activeCampaignId || (nextCampaigns.status === "fulfilled" && nextCampaigns.value[0]?.id) || "";
+    if (idToFetch) {
+      void fetchErrorGroups(idToFetch).then((groups) => {
+        if (groups.length > 0) setErrorGroups((prev) => [...groups, ...prev.filter((g) => g.campaignId !== idToFetch)]);
+      }).catch(() => undefined);
+    }
   }
 
   useEffect(() => {
     if (!session) return;
-    const socket = new WebSocket(operationsWebSocketURL());
-    opsSocketRef.current = socket;
-    socket.onopen = () => setApiState("websocket commands");
-    socket.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data) as Record<string, unknown>;
-        applyRealtimeMessage(message);
-        const requestID = String(message.request_id ?? "");
-        const pending = pendingOpsRef.current.get(requestID);
-        if (pending) {
-          pendingOpsRef.current.delete(requestID);
-          if (message.type === "command.error") pending.reject(new Error(String(message.error ?? "command_failed")));
-          else pending.resolve(message);
+    let stopped = false;
+
+    function connect() {
+      if (stopped) return;
+      const socket = new WebSocket(operationsWebSocketURL());
+      opsSocketRef.current = socket;
+      socket.onopen = () => setApiState("websocket commands");
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data) as Record<string, unknown>;
+          applyRealtimeMessage(message);
+          const requestID = String(message.request_id ?? "");
+          const pending = pendingOpsRef.current.get(requestID);
+          if (pending) {
+            pendingOpsRef.current.delete(requestID);
+            if (message.type === "command.error") pending.reject(new Error(String(message.error ?? "command_failed")));
+            else pending.resolve(message);
+          }
+        } catch (err) {
+          console.error("ops ws parse error:", err);
         }
-      } catch {
-        // ignore malformed websocket payloads
-      }
-    };
-    socket.onclose = () => {
-      if (opsSocketRef.current === socket) opsSocketRef.current = null;
-      setApiState((current) => current === "websocket commands" ? "websocket reconnecting" : current);
-    };
+      };
+      socket.onclose = () => {
+        if (opsSocketRef.current === socket) opsSocketRef.current = null;
+        setApiState((current) => current === "websocket commands" ? "websocket reconnecting" : current);
+        if (!stopped) window.setTimeout(connect, 2000);
+      };
+    }
+
+    connect();
     return () => {
-      socket.close();
-      if (opsSocketRef.current === socket) opsSocketRef.current = null;
+      stopped = true;
+      const socket = opsSocketRef.current;
+      if (socket) {
+        socket.close();
+        opsSocketRef.current = null;
+      }
     };
   }, [session]);
 
@@ -154,16 +179,19 @@ export function App() {
         try {
           const snapshot = JSON.parse(event.data);
           applyCampaignSnapshot(snapshot);
-          if (snapshot.campaign_id === selectedCampaignId) {
+          if (snapshot.campaign_id === selectedCampaignIdRef.current) {
             void fetchErrorGroups(snapshot.campaign_id).then((groups) => {
-              if (!closed) setErrorGroups(groups);
+              if (!closed && groups.length > 0) setErrorGroups((prev) => [
+                ...groups,
+                ...prev.filter((g) => g.campaignId !== snapshot.campaign_id),
+              ]);
             }).catch(() => undefined);
             void fetchDeliveries(snapshot.campaign_id).then((rows) => {
               if (!closed && rows.length > 0) setDeliveries(rows);
             }).catch(() => undefined);
           }
-        } catch {
-          // ignore malformed websocket payloads
+        } catch (err) {
+          console.error("campaign ws parse error:", err);
         }
       };
       socket.onopen = () => setApiState("websocket live");
@@ -173,7 +201,7 @@ export function App() {
       closed = true;
       sockets.forEach((socket) => socket.close());
     };
-  }, [session, campaigns.map((campaign) => campaign.id).sort().join("|"), selectedCampaignId, setCampaigns, setDeliveries, setErrorGroups]);
+  }, [session, campaigns.map((campaign) => campaign.id).sort().join("|")]);
 
   useEffect(() => {
     if (apiState !== "local fallback") return;
@@ -320,6 +348,7 @@ export function App() {
     addEvent("info", "campaign.started", `Campaign ${optimisticCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
 
     try {
+      await sendOpsCommand("template.save", { template }).catch(() => undefined);
       const result = await sendOpsCommand("campaign.create", {
         name: wizard.name,
         template_id: template.id,

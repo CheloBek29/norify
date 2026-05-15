@@ -442,11 +442,11 @@ export async function fetchChannels(): Promise<Channel[]> {
 }
 
 export function campaignWebSocketURL(campaignId: string): string {
-  return `${api.status.replace("http", "ws")}/ws/campaigns/${campaignId}`;
+  return `${api.status.replace(/^http/, "ws")}/ws/campaigns/${campaignId}`;
 }
 
 export function operationsWebSocketURL(): string {
-  return `${api.status.replace("http", "ws")}/ws/ops`;
+  return `${api.status.replace(/^http/, "ws")}/ws/ops`;
 }
 
 export function normalizeCampaign(item: Record<string, unknown>): Campaign {

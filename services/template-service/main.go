@@ -32,6 +32,7 @@ func main() {
 	appruntime.LogStartup("template-service postgres", err)
 	if db != nil {
 		defer db.Close()
+		loadTemplatesFromDB(ctx)
 	}
 
 	mux := httpapi.NewMux(httpapi.Service{Name: "template-service", Version: "0.2.0"})
@@ -39,6 +40,35 @@ func main() {
 	mux.HandleFunc("/templates/variables", templateVariables)
 	mux.HandleFunc("/templates/", templateItem)
 	_ = httpapi.Listen("template-service", mux)
+}
+
+func loadTemplatesFromDB(ctx context.Context) {
+	rows, err := db.Query(ctx, `SELECT id, name, body, COALESCE(variables, '{}'), version FROM templates ORDER BY created_at`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	templateStore.Lock()
+	defer templateStore.Unlock()
+	for rows.Next() {
+		var tpl templates.Template
+		if err := rows.Scan(&tpl.ID, &tpl.Name, &tpl.Body, &tpl.Variables, &tpl.Version); err != nil {
+			continue
+		}
+		templateStore.items[tpl.ID] = tpl
+	}
+}
+
+func saveTemplateToDB(ctx context.Context, tpl templates.Template) {
+	if db == nil {
+		return
+	}
+	_, _ = db.Exec(ctx, `
+		INSERT INTO templates (id, name, body, variables, version, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, body = EXCLUDED.body,
+		    variables = EXCLUDED.variables, version = EXCLUDED.version, updated_at = now()`,
+		tpl.ID, tpl.Name, tpl.Body, tpl.Variables, tpl.Version)
 }
 
 func templatesCollection(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +98,7 @@ func templatesCollection(w http.ResponseWriter, r *http.Request) {
 		templateStore.Lock()
 		templateStore.items[tpl.ID] = tpl
 		templateStore.Unlock()
+		saveTemplateToDB(r.Context(), tpl)
 		httpapi.WriteJSON(w, http.StatusCreated, tpl)
 	default:
 		httpapi.WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
@@ -162,6 +193,7 @@ func templateItem(w http.ResponseWriter, r *http.Request) {
 		updated.ID = id
 		updated.Version = templates.NextVersion(tpl.Version)
 		templateStore.items[id] = updated
+		saveTemplateToDB(r.Context(), updated)
 		httpapi.WriteJSON(w, http.StatusOK, updated)
 	case http.MethodDelete:
 		delete(templateStore.items, id)
