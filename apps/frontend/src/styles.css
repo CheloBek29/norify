@@ -684,3 +684,99 @@ th { color: #65746f; font-size: 12px; text-transform: uppercase; }
   .navList { grid-template-columns: 1fr; }
   .loginPanel { padding: 18px; }
 }
+
+/* ── AI Generator ── */
+.templatesTabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+.tabBtn {
+  padding: 8px 20px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: all 0.15s;
+}
+.tabBtn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.aiGenerator {
+  max-width: 800px;
+  margin: 0 auto;
+}
+.aiSteps {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.aiStep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.4;
+  transition: opacity 0.2s;
+}
+.aiStep.active, .aiStep.done { opacity: 1; }
+.aiStep span {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.8rem;
+}
+.aiStep.active span { background: var(--accent); color: #fff; border-color: var(--accent); }
+.aiStep.done span { background: #22c55e; color: #fff; border-color: #22c55e; }
+.aiStep p { font-size: 0.85rem; color: var(--text-muted); margin: 0; }
+.aiError {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  color: #b91c1c;
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+.aiPanel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.aiPanel h3 { margin: 0 0 4px; font-size: 1.1rem; }
+.aiPanel label { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; font-weight: 600; }
+.aiPanel textarea, .aiPanel input[type="email"], .aiPanel input[type="text"], .aiPanel select {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.95rem;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+.aiPanel textarea:focus, .aiPanel input:focus, .aiPanel select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.aiActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.aiActions button { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.9rem; background: var(--surface); }
+.aiHtmlResult { margin-top: 8px; }

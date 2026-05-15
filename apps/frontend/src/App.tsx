@@ -839,10 +839,154 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
   );
 }
 
+const TEMPLATE_GENERATOR_URL = "http://localhost:8091";
+
+type AIStyle = "professional" | "creative" | "luxury" | "minimal" | "ecommerce";
+
+function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [taskDesc, setTaskDesc] = useState("");
+  const [style, setStyle] = useState<AIStyle>("professional");
+  const [generatedText, setGeneratedText] = useState("");
+  const [brandName, setBrandName] = useState("My Company");
+  const [brandEmail, setBrandEmail] = useState("info@example.com");
+  const [imageB64, setImageB64] = useState("");
+  const [generatedHTML, setGeneratedHTML] = useState("");
+  const [showPreview, setShowPreview] = useState(false);
+
+  async function handleGenerateText() {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`${TEMPLATE_GENERATOR_URL}/api/generate-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_description: taskDesc, style }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Generation failed");
+      setGeneratedText(data.text);
+      setStep(2);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGenerateHTML() {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`${TEMPLATE_GENERATOR_URL}/api/generate-html`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ newsletter_text: generatedText, brand_name: brandName, brand_email: brandEmail, image_base64: imageB64 || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "HTML generation failed");
+      setGeneratedHTML(data.html);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => setImageB64(reader.result as string);
+    reader.readAsDataURL(file);
+  }
+
+  function downloadHTML() {
+    const a = document.createElement("a");
+    a.href = "data:text/html;charset=utf-8," + encodeURIComponent(generatedHTML);
+    a.download = "newsletter.html";
+    a.click();
+  }
+
+  return (
+    <div className="aiGenerator">
+      <div className="aiSteps">
+        {([1, 2, 3] as const).map((s) => (
+          <div key={s} className={`aiStep${step === s ? " active" : step > s ? " done" : ""}`}>
+            <span>{s}</span>
+            <p>{s === 1 ? "Описание" : s === 2 ? "Текст" : "HTML"}</p>
+          </div>
+        ))}
+      </div>
+
+      {error && <div className="aiError">{error}</div>}
+
+      {step === 1 && (
+        <div className="aiPanel">
+          <h3>Опишите задачу для рассылки</h3>
+          <label>Описание<textarea value={taskDesc} onChange={(e) => setTaskDesc(e.target.value)} rows={5} placeholder="Пример: Создай рассылку для интернет-магазина. Скидка 30% на смартфоны. Аудитория: 18-35 лет." /></label>
+          <label>Стиль
+            <select value={style} onChange={(e) => setStyle(e.target.value as AIStyle)}>
+              <option value="professional">Профессиональный</option>
+              <option value="creative">Креативный</option>
+              <option value="luxury">Люкс</option>
+              <option value="minimal">Минимализм</option>
+              <option value="ecommerce">E-commerce</option>
+            </select>
+          </label>
+          <button className="primary" disabled={taskDesc.length < 10 || loading} onClick={handleGenerateText}>
+            {loading ? "Генерирую... (30-60 сек)" : "Сгенерировать текст"}
+          </button>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="aiPanel">
+          <h3>Готовый текст рассылки</h3>
+          <label>Отредактируйте при необходимости<textarea value={generatedText} onChange={(e) => setGeneratedText(e.target.value)} rows={10} /></label>
+          <div className="aiActions">
+            <button onClick={() => setStep(1)}>← Назад</button>
+            <button onClick={() => { onApply(generatedText); }}>Использовать как шаблон</button>
+            <button className="primary" onClick={() => setStep(3)}>Создать HTML →</button>
+          </div>
+        </div>
+      )}
+
+      {step === 3 && (
+        <div className="aiPanel">
+          <h3>Создание HTML шаблона</h3>
+          <div className="fieldGrid">
+            <label>Название компании<input value={brandName} onChange={(e) => setBrandName(e.target.value)} /></label>
+            <label>Email<input type="email" value={brandEmail} onChange={(e) => setBrandEmail(e.target.value)} /></label>
+          </div>
+          <label>Логотип / изображение (опционально)<input type="file" accept="image/*" onChange={handleImageUpload} /></label>
+          {imageB64 && <img src={imageB64} alt="preview" style={{ maxHeight: 80, marginTop: 8 }} />}
+          <button className="primary" disabled={loading} onClick={handleGenerateHTML}>
+            {loading ? "Создаю шаблон... (15-30 сек)" : "Создать HTML шаблон"}
+          </button>
+          {generatedHTML && (
+            <div className="aiHtmlResult">
+              <div className="aiActions">
+                <button onClick={() => setShowPreview(!showPreview)}>{showPreview ? "Скрыть превью" : "Предпросмотр"}</button>
+                <button onClick={downloadHTML}>Скачать HTML</button>
+              </div>
+              {showPreview && <iframe srcDoc={generatedHTML} style={{ width: "100%", height: 500, border: "1px solid #ddd", marginTop: 12, borderRadius: 6 }} />}
+            </div>
+          )}
+          <button onClick={() => setStep(2)} style={{ marginTop: 8 }}>← Назад</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Templates({ templates, onSave }: { templates: Template[]; onSave: (template: Template) => void }) {
   const initialTemplate = templates[0] ?? createBlankTemplate();
   const [editing, setEditing] = useState<Template>(initialTemplate);
   const [query, setQuery] = useState("");
+  const [activeTab, setActiveTab] = useState<"library" | "ai">("library");
   const declaredVariables = normalizeVariables(editing.variables.join(", "));
   const detectedVariables = extractTemplateVariables(editing.body);
   const missingVariables = detectedVariables.filter((variable) => !declaredVariables.includes(variable));
@@ -872,7 +1016,13 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
   }
 
   return (
-    <div className="templatesLayout">
+    <div>
+      <div className="templatesTabs">
+        <button className={activeTab === "library" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("library")}>Template Library</button>
+        <button className={activeTab === "ai" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("ai")}>AI Generator</button>
+      </div>
+      {activeTab === "ai" && <AIGenerator onApply={(text) => { setEditing({ ...createBlankTemplate(), body: text }); setActiveTab("library"); }} />}
+      {activeTab === "library" && <div className="templatesLayout">
       <section className="panel templateLibraryPanel">
         <div className="panelHeader">
           <h2>Template library</h2>
@@ -953,6 +1103,7 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
           ))}
         </div>
       </section>
+    </div>}
     </div>
   );
 }
