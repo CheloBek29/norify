@@ -1,0 +1,290 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: auth-service}}
+  template:
+    metadata: {labels: {app: auth-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/auth-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - configMapRef: {name: norify-config}
+            - secretRef: {name: norify-secret}
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: norify
+spec:
+  selector: {app: auth-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: user-service}}
+  template:
+    metadata: {labels: {app: user-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/user-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: norify
+spec:
+  selector: {app: user-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sender-worker
+  namespace: norify
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: sender-worker}}
+  template:
+    metadata: {labels: {app: sender-worker}}
+    spec:
+      containers:
+        - name: worker
+          image: norify/sender-worker:latest
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - configMapRef: {name: norify-config}
+            - secretRef: {name: norify-secret}
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sender-worker
+  namespace: norify
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sender-worker
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: template-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: template-service}}
+  template:
+    metadata: {labels: {app: template-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/template-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: template-service
+  namespace: norify
+spec:
+  selector: {app: template-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: channel-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: channel-service}}
+  template:
+    metadata: {labels: {app: channel-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/channel-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: channel-service
+  namespace: norify
+spec:
+  selector: {app: channel-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: campaign-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: campaign-service}}
+  template:
+    metadata: {labels: {app: campaign-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/campaign-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: campaign-service
+  namespace: norify
+spec:
+  selector: {app: campaign-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatcher-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: dispatcher-service}}
+  template:
+    metadata: {labels: {app: dispatcher-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/dispatcher-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dispatcher-service
+  namespace: norify
+spec:
+  selector: {app: dispatcher-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-error-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: notification-error-service}}
+  template:
+    metadata: {labels: {app: notification-error-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/notification-error-service:latest
+          ports: [{containerPort: 8080}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-error-service
+  namespace: norify
+spec:
+  selector: {app: notification-error-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: status-service
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: status-service}}
+  template:
+    metadata: {labels: {app: status-service}}
+    spec:
+      containers:
+        - name: service
+          image: norify/status-service:latest
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: status-service
+  namespace: norify
+spec:
+  selector: {app: status-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: frontend}}
+  template:
+    metadata: {labels: {app: frontend}}
+    spec:
+      containers:
+        - name: frontend
+          image: norify/frontend:latest
+          ports: [{containerPort: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: norify
+spec:
+  selector: {app: frontend}
+  ports: [{port: 80, targetPort: 80}]

@@ -1,0 +1,23 @@
+{
+  "vhosts": [{"name": "/"}],
+  "users": [{"name": "guest", "password": "guest", "tags": "administrator"}],
+  "permissions": [{"user": "guest", "vhost": "/", "configure": ".*", "write": ".*", "read": ".*"}],
+  "exchanges": [
+    {"name": "campaign.status.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {}},
+    {"name": "message.status.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {}},
+    {"name": "message.send.dlx", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {}}
+  ],
+  "queues": [
+    {"name": "campaign.dispatch.request", "vhost": "/", "durable": true},
+    {"name": "message.send.request", "vhost": "/", "durable": true, "arguments": {"x-dead-letter-exchange": "message.send.dlx", "x-max-priority": 10}},
+    {"name": "message.send.retry", "vhost": "/", "durable": true, "arguments": {"x-dead-letter-exchange": "", "x-dead-letter-routing-key": "message.send.request", "x-message-ttl": 5000}},
+    {"name": "message.send.dlq", "vhost": "/", "durable": true},
+    {"name": "message.status.events", "vhost": "/", "durable": true},
+    {"name": "campaign.status.events", "vhost": "/", "durable": true}
+  ],
+  "bindings": [
+    {"source": "message.send.dlx", "vhost": "/", "destination": "message.send.dlq", "destination_type": "queue", "routing_key": "failed"},
+    {"source": "message.status.events", "vhost": "/", "destination": "message.status.events", "destination_type": "queue", "routing_key": "#"},
+    {"source": "campaign.status.events", "vhost": "/", "destination": "campaign.status.events", "destination_type": "queue", "routing_key": "#"}
+  ]
+}

@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: norify-services
+    static_configs:
+      - targets:
+          - auth-service:8080
+          - user-service:8080
+          - template-service:8080
+          - channel-service:8080
+          - campaign-service:8080
+          - dispatcher-service:8080
+          - sender-worker:8080
+          - notification-error-service:8080
+          - status-service:8080
+

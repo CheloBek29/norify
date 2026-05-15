@@ -1,0 +1,179 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: norify
+      POSTGRES_USER: norify
+      POSTGRES_PASSWORD: norify
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U norify -d norify"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres-viewer:
+    image: adminer:4.8.1
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8089:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - ./deploy/docker-compose/rabbitmq-definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./deploy/docker-compose/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    environment:
+      PORT: 8080
+      JWT_SECRET: local-dev-secret
+      POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user-service/Dockerfile
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  template-service:
+    build:
+      context: .
+      dockerfile: services/template-service/Dockerfile
+    ports:
+      - "8083:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  channel-service:
+    build:
+      context: .
+      dockerfile: services/channel-service/Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
+    ports:
+      - "8084:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  campaign-service:
+    build:
+      context: .
+      dockerfile: services/campaign-service/Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      DISPATCH_BATCH_SIZE: 50000
+    ports:
+      - "8085:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  dispatcher-service:
+    build:
+      context: .
+      dockerfile: services/dispatcher-service/Dockerfile
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      CAMPAIGN_SERVICE_URL: http://campaign-service:8080
+    ports:
+      - "8086:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  sender-worker:
+    build:
+      context: .
+      dockerfile: services/sender-worker/Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WORKER_PREFETCH: 30
+      CHANNEL_STUB_MIN_DELAY_SECONDS: 1
+      CHANNEL_STUB_MAX_DELAY_SECONDS: 3
+    ports:
+      - "8087:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notification-error-service:
+    build:
+      context: .
+      dockerfile: services/notification-error-service/Dockerfile
+    ports:
+      - "8088:8080"
+
+  status-service:
+    build:
+      context: ./apps/status-service
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      AUTH_SERVICE_URL: http://auth-service:8080
+      USER_SERVICE_URL: http://user-service:8080
+      CAMPAIGN_SERVICE_URL: http://campaign-service:8080
+      CHANNEL_SERVICE_URL: http://channel-service:8080
+      TEMPLATE_SERVICE_URL: http://template-service:8080
+      DISPATCHER_SERVICE_URL: http://dispatcher-service:8080
+      SENDER_SERVICE_URL: http://sender-worker:8080
+      NOTIFICATION_ERROR_SERVICE_URL: http://notification-error-service:8080
+      STATUS_SERVICE_URL: http://status-service:8080
+    ports:
+      - "8090:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./apps/frontend
+    ports:
+      - "3000:80"

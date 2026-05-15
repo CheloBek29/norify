@@ -1,0 +1,12 @@
+{
+  "title": "Norify Notification Platform",
+  "panels": [
+    {"type": "timeseries", "title": "campaign_dispatch_p95_ms", "targets": [{"expr": "campaign_dispatch_p95_ms"}]},
+    {"type": "timeseries", "title": "message_success_total", "targets": [{"expr": "message_success_total"}]},
+    {"type": "timeseries", "title": "message_failed_total", "targets": [{"expr": "message_failed_total"}]},
+    {"type": "stat", "title": "websocket_connected_clients", "targets": [{"expr": "websocket_connected_clients"}]}
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}
+
