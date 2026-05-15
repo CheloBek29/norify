@@ -18,6 +18,12 @@ export type Template = {
   updatedAt: string;
 };
 
+export type TemplateVariable = {
+  name: string;
+  type: string;
+  source: string;
+};
+
 export type Channel = {
   code: string;
   name: string;
@@ -66,6 +72,7 @@ export type Campaign = {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  archivedAt?: string;
 };
 
 export type Delivery = {
@@ -152,6 +159,20 @@ export const templatesSeed: Template[] = [
     version: 1,
     updatedAt: "2026-05-10T11:05:00Z",
   },
+];
+
+export const templateVariablesSeed: TemplateVariable[] = [
+  { name: "id", type: "text", source: "users" },
+  { name: "email", type: "text", source: "users" },
+  { name: "phone", type: "text", source: "users" },
+  { name: "telegram_id", type: "text", source: "users" },
+  { name: "vk_id", type: "text", source: "users" },
+  { name: "custom_app_id", type: "text", source: "users" },
+  { name: "age", type: "integer", source: "users" },
+  { name: "gender", type: "text", source: "users" },
+  { name: "location", type: "text", source: "users" },
+  { name: "tags", type: "text[]", source: "users" },
+  { name: "created_at", type: "timestamp", source: "users" },
 ];
 
 export const channelsSeed: Channel[] = [
@@ -277,8 +298,14 @@ export function audiencePreview(filter: AudienceFilter): number {
 }
 
 export function progressPercent(campaign: Campaign): number {
-  if (campaign.totalMessages === 0) return 0;
-  return Math.min(100, Math.round((campaign.processed / campaign.totalMessages) * 10000) / 100);
+  const totalMessages = effectiveTotalMessages(campaign);
+  if (totalMessages === 0) return 0;
+  return Math.min(100, Math.round((campaign.processed / totalMessages) * 10000) / 100);
+}
+
+export function effectiveTotalMessages(campaign: Campaign): number {
+  if (campaign.totalMessages > 0) return campaign.totalMessages;
+  return campaign.totalRecipients * campaign.selectedChannels.length;
 }
 
 const api = {
@@ -380,6 +407,17 @@ export async function fetchTemplates(): Promise<Template[]> {
   }));
 }
 
+export async function fetchTemplateVariables(): Promise<TemplateVariable[]> {
+  const response = await fetch(`${api.templates}/templates/variables`);
+  if (!response.ok) throw new Error("template_variables_unavailable");
+  const payload = await response.json();
+  return payload.map((item: Record<string, unknown>) => ({
+    name: String(item.name ?? item.column_name ?? item.ColumnName),
+    type: String(item.type ?? item.data_type ?? item.DataType ?? "text"),
+    source: String(item.source ?? item.table_name ?? item.TableName ?? "users"),
+  }));
+}
+
 export async function fetchChannels(): Promise<Channel[]> {
   const response = await fetch(`${api.channels}/channels`);
   if (!response.ok) throw new Error("channels_unavailable");
@@ -404,11 +442,11 @@ export async function fetchChannels(): Promise<Channel[]> {
 }
 
 export function campaignWebSocketURL(campaignId: string): string {
-  return `${api.status.replace("http", "ws")}/ws/campaigns/${campaignId}`;
+  return `${api.status.replace(/^http/, "ws")}/ws/campaigns/${campaignId}`;
 }
 
 export function operationsWebSocketURL(): string {
-  return `${api.status.replace("http", "ws")}/ws/ops`;
+  return `${api.status.replace(/^http/, "ws")}/ws/ops`;
 }
 
 export function normalizeCampaign(item: Record<string, unknown>): Campaign {
@@ -438,6 +476,7 @@ export function normalizeCampaign(item: Record<string, unknown>): Campaign {
     createdAt: String(item.created_at ?? item.CreatedAt ?? new Date().toISOString()),
     startedAt: optionalString(item.started_at ?? item.StartedAt),
     finishedAt: optionalString(item.finished_at ?? item.FinishedAt),
+    archivedAt: optionalString(item.archived_at ?? item.ArchivedAt),
   };
 }
 

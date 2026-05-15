@@ -1,4 +1,4 @@
-import { type Dispatch, type FormEvent, type SetStateAction, useEffect, useRef, useState } from "react";
+import { type CSSProperties, type Dispatch, type FormEvent, type SetStateAction, useEffect, useRef, useState } from "react";
 import {
   ActionableError,
   AudienceFilter,
@@ -11,6 +11,7 @@ import {
   ServiceHealth,
   SystemEvent,
   Template,
+  TemplateVariable,
   audiencePreview,
   campaignsSeed,
   channelsSeed,
@@ -18,6 +19,7 @@ import {
   currentError,
   defaultFilter,
   deliveriesSeed,
+  effectiveTotalMessages,
   errorGroupsSeed,
   eventsSeed,
   managersSeed,
@@ -31,25 +33,28 @@ import {
   fetchErrorGroups,
   fetchServiceHealth,
   fetchTemplates,
+  fetchTemplateVariables,
   normalizeCampaign,
   operationsWebSocketURL,
   serviceHealthTargets,
+  templateVariablesSeed,
 } from "./api";
 
 type Screen = "dashboard" | "campaigns" | "create" | "templates" | "channels" | "deliveries" | "stats" | "managers" | "health" | "logs";
-type CampaignCommand = "start" | "stop" | "retry" | "switch_channel" | "cancel_campaign";
+type CampaignCommand = "start" | "stop" | "retry" | "switch_channel" | "cancel_campaign" | "archive";
+type ThemeName = "sky" | "pink" | "mint" | "custom";
 
 const navigation: { id: Screen; label: string; icon: IconName; adminOnly?: boolean }[] = [
-  { id: "dashboard", label: "Dashboard", icon: "dashboard" },
-  { id: "campaigns", label: "Campaigns", icon: "campaign" },
-  { id: "create", label: "Create", icon: "plus" },
-  { id: "templates", label: "Templates", icon: "template" },
-  { id: "channels", label: "Channels", icon: "channel" },
-  { id: "deliveries", label: "Deliveries", icon: "table" },
-  { id: "stats", label: "Stats", icon: "chart" },
-  { id: "managers", label: "Managers", icon: "users", adminOnly: true },
-  { id: "health", label: "Health", icon: "pulse", adminOnly: true },
-  { id: "logs", label: "Logs", icon: "log", adminOnly: true },
+  { id: "dashboard", label: "Панель", icon: "dashboard" },
+  { id: "campaigns", label: "Кампании", icon: "campaign" },
+  { id: "create", label: "Создать", icon: "plus" },
+  { id: "templates", label: "Шаблоны", icon: "template" },
+  { id: "channels", label: "Каналы", icon: "channel" },
+  { id: "deliveries", label: "Доставки", icon: "table" },
+  { id: "stats", label: "Статистика", icon: "chart" },
+  { id: "managers", label: "Менеджеры", icon: "users", adminOnly: true },
+  { id: "health", label: "Здоровье", icon: "pulse", adminOnly: true },
+  { id: "logs", label: "Логи", icon: "log", adminOnly: true },
 ];
 
 type Session = { email: string; role: Role } | null;
@@ -63,8 +68,11 @@ type WizardState = {
 
 export function App() {
   const [session, setSession] = useLocalState<Session>("norify-session", null);
+  const [theme, setTheme] = useLocalState<ThemeName>("norify-theme", "sky");
+  const [customColor, setCustomColor] = useLocalState("norify-custom-color", "#1f95f2");
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [templates, setTemplates] = useLocalState<Template[]>("norify-templates", templatesSeed);
+  const [templateVariables, setTemplateVariables] = useLocalState<TemplateVariable[]>("norify-template-variables", templateVariablesSeed);
   const [channels, setChannels] = useLocalState<Channel[]>("norify-channels", channelsSeed);
   const [campaigns, setCampaigns] = useLocalState<Campaign[]>("norify-campaigns", campaignsSeed);
   const [deliveries, setDeliveries] = useLocalState<Delivery[]>("norify-deliveries", deliveriesSeed);
@@ -76,8 +84,14 @@ export function App() {
   const [apiState, setApiState] = useState("connecting");
   const opsSocketRef = useRef<WebSocket | null>(null);
   const pendingOpsRef = useRef(new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>());
-  const selectedCampaign = campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? campaigns[0];
+  const selectedCampaignIdRef = useRef(selectedCampaignId);
+  const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
+  const selectedCampaign = activeCampaigns.find((campaign) => campaign.id === selectedCampaignId) ?? activeCampaigns[0] ?? campaigns[0];
   const activeError = selectedCampaign && selectedCampaign.failed > 0 ? buildError(selectedCampaign) : currentError;
+
+  useEffect(() => {
+    selectedCampaignIdRef.current = selectedCampaignId;
+  }, [selectedCampaignId]);
 
   useEffect(() => {
     if (!session) return;
@@ -85,47 +99,74 @@ export function App() {
   }, [session]);
 
   async function refreshBackendData() {
-    try {
-      const [nextCampaigns, nextTemplates, nextChannels] = await Promise.all([fetchCampaigns(), fetchTemplates(), fetchChannels()]);
-      if (nextCampaigns.length > 0) {
-        setCampaigns(nextCampaigns);
-        setSelectedCampaignId((current) => current || nextCampaigns[0].id);
-      }
-      if (nextTemplates.length > 0) setTemplates(nextTemplates);
-      if (nextChannels.length > 0) setChannels(nextChannels);
+    const [nextCampaigns, nextTemplates, nextChannels, nextTemplateVariables] = await Promise.allSettled([
+      fetchCampaigns(),
+      fetchTemplates(),
+      fetchChannels(),
+      fetchTemplateVariables(),
+    ]);
+    const hasLiveData = [nextCampaigns, nextTemplates, nextChannels, nextTemplateVariables].some((result) => result.status === "fulfilled");
+    let activeCampaignId = "";
+    if (nextCampaigns.status === "fulfilled" && nextCampaigns.value.length > 0) {
+      setCampaigns(nextCampaigns.value);
+      activeCampaignId = nextCampaigns.value.find((campaign) => !campaign.archivedAt)?.id || nextCampaigns.value[0].id;
+      setSelectedCampaignId((current) => current || activeCampaignId);
+    }
+    if (nextTemplates.status === "fulfilled" && nextTemplates.value.length > 0) setTemplates(nextTemplates.value);
+    if (nextTemplateVariables.status === "fulfilled" && nextTemplateVariables.value.length > 0) setTemplateVariables(nextTemplateVariables.value);
+    if (nextChannels.status === "fulfilled" && nextChannels.value.length > 0) setChannels(nextChannels.value);
+    if (hasLiveData) {
       setApiState("live backend");
-    } catch {
+    } else {
       setApiState("local fallback");
+    }
+    const idToFetch = activeCampaignId || (nextCampaigns.status === "fulfilled" && nextCampaigns.value[0]?.id) || "";
+    if (idToFetch) {
+      void fetchErrorGroups(idToFetch).then((groups) => {
+        if (groups.length > 0) setErrorGroups((prev) => [...groups, ...prev.filter((g) => g.campaignId !== idToFetch)]);
+      }).catch(() => undefined);
     }
   }
 
   useEffect(() => {
     if (!session) return;
-    const socket = new WebSocket(operationsWebSocketURL());
-    opsSocketRef.current = socket;
-    socket.onopen = () => setApiState("websocket commands");
-    socket.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data) as Record<string, unknown>;
-        applyRealtimeMessage(message);
-        const requestID = String(message.request_id ?? "");
-        const pending = pendingOpsRef.current.get(requestID);
-        if (pending) {
-          pendingOpsRef.current.delete(requestID);
-          if (message.type === "command.error") pending.reject(new Error(String(message.error ?? "command_failed")));
-          else pending.resolve(message);
+    let stopped = false;
+
+    function connect() {
+      if (stopped) return;
+      const socket = new WebSocket(operationsWebSocketURL());
+      opsSocketRef.current = socket;
+      socket.onopen = () => setApiState("websocket commands");
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data) as Record<string, unknown>;
+          applyRealtimeMessage(message);
+          const requestID = String(message.request_id ?? "");
+          const pending = pendingOpsRef.current.get(requestID);
+          if (pending) {
+            pendingOpsRef.current.delete(requestID);
+            if (message.type === "command.error") pending.reject(new Error(String(message.error ?? "command_failed")));
+            else pending.resolve(message);
+          }
+        } catch (err) {
+          console.error("ops ws parse error:", err);
         }
-      } catch {
-        // ignore malformed websocket payloads
-      }
-    };
-    socket.onclose = () => {
-      if (opsSocketRef.current === socket) opsSocketRef.current = null;
-      setApiState((current) => current === "websocket commands" ? "websocket reconnecting" : current);
-    };
+      };
+      socket.onclose = () => {
+        if (opsSocketRef.current === socket) opsSocketRef.current = null;
+        setApiState((current) => current === "websocket commands" ? "websocket reconnecting" : current);
+        if (!stopped) window.setTimeout(connect, 2000);
+      };
+    }
+
+    connect();
     return () => {
-      socket.close();
-      if (opsSocketRef.current === socket) opsSocketRef.current = null;
+      stopped = true;
+      const socket = opsSocketRef.current;
+      if (socket) {
+        socket.close();
+        opsSocketRef.current = null;
+      }
     };
   }, [session]);
 
@@ -138,16 +179,19 @@ export function App() {
         try {
           const snapshot = JSON.parse(event.data);
           applyCampaignSnapshot(snapshot);
-          if (snapshot.campaign_id === selectedCampaignId) {
+          if (snapshot.campaign_id === selectedCampaignIdRef.current) {
             void fetchErrorGroups(snapshot.campaign_id).then((groups) => {
-              if (!closed) setErrorGroups(groups);
+              if (!closed && groups.length > 0) setErrorGroups((prev) => [
+                ...groups,
+                ...prev.filter((g) => g.campaignId !== snapshot.campaign_id),
+              ]);
             }).catch(() => undefined);
             void fetchDeliveries(snapshot.campaign_id).then((rows) => {
               if (!closed && rows.length > 0) setDeliveries(rows);
             }).catch(() => undefined);
           }
-        } catch {
-          // ignore malformed websocket payloads
+        } catch (err) {
+          console.error("campaign ws parse error:", err);
         }
       };
       socket.onopen = () => setApiState("websocket live");
@@ -157,7 +201,7 @@ export function App() {
       closed = true;
       sockets.forEach((socket) => socket.close());
     };
-  }, [session, campaigns.map((campaign) => campaign.id).sort().join("|"), selectedCampaignId, setCampaigns, setDeliveries, setErrorGroups]);
+  }, [session, campaigns.map((campaign) => campaign.id).sort().join("|")]);
 
   useEffect(() => {
     if (apiState !== "local fallback") return;
@@ -188,7 +232,7 @@ export function App() {
   }, [apiState, setCampaigns]);
 
   if (!session) {
-    return <Login onLogin={setSession} />;
+    return <Login theme={theme} customColor={customColor} onThemeChange={setTheme} onCustomColorChange={setCustomColor} onLogin={setSession} />;
   }
   const userSession = session;
 
@@ -222,14 +266,14 @@ export function App() {
   function applyRealtimeMessage(message: Record<string, unknown>) {
     if (message.type === "campaign.upsert" && message.campaign) {
       const campaign = normalizeCampaign(message.campaign as Record<string, unknown>);
-      setCampaigns((items) => [campaign, ...items.filter((item) => item.id !== campaign.id)]);
+      setCampaigns((items) => upsertCampaign(items, campaign));
       setSelectedCampaignId((current) => current || campaign.id);
     }
     if (message.type === "error_group.resolved") {
       const groupID = String(message.group_id ?? "");
       if (message.campaign) {
         const campaign = normalizeCampaign(message.campaign as Record<string, unknown>);
-        setCampaigns((items) => items.map((item) => item.id === campaign.id ? campaign : item));
+        setCampaigns((items) => items.map((item) => item.id === campaign.id ? mergeCampaignUpdate(item, campaign) : item));
       }
       if (groupID) setErrorGroups((items) => items.filter((item) => item.id !== groupID));
     }
@@ -256,15 +300,21 @@ export function App() {
       const nextStatus = String(snapshot.status ?? campaign.status) as Campaign["status"];
       const frozenStatus = campaign.status === "stopped" || campaign.status === "cancelled" || campaign.status === "finished";
       const staleActiveSnapshot = nextStatus === "running" || nextStatus === "retrying";
-      if (frozenStatus && staleActiveSnapshot) return campaign;
+      if (frozenStatus && staleActiveSnapshot) {
+        return {
+          ...campaign,
+          p95DispatchMs: Number(snapshot.p95_dispatch_ms ?? snapshot.p95DispatchMs ?? campaign.p95DispatchMs),
+        };
+      }
       return {
         ...campaign,
         status: nextStatus,
-        totalMessages: Number(snapshot.total_messages ?? campaign.totalMessages),
-        processed: Number(snapshot.processed ?? campaign.processed),
-        success: Number(snapshot.success ?? campaign.success),
-        failed: Number(snapshot.failed ?? campaign.failed),
-        cancelled: Number(snapshot.cancelled ?? campaign.cancelled),
+        totalMessages: snapshotLooksEmpty(snapshot, campaign) ? campaign.totalMessages : Number(snapshot.total_messages ?? campaign.totalMessages),
+        processed: snapshotLooksEmpty(snapshot, campaign) ? campaign.processed : Number(snapshot.processed ?? campaign.processed),
+        success: snapshotLooksEmpty(snapshot, campaign) ? campaign.success : Number(snapshot.success ?? campaign.success),
+        failed: snapshotLooksEmpty(snapshot, campaign) ? campaign.failed : Number(snapshot.failed ?? campaign.failed),
+        cancelled: snapshotLooksEmpty(snapshot, campaign) ? campaign.cancelled : Number(snapshot.cancelled ?? campaign.cancelled),
+        p95DispatchMs: Number(snapshot.p95_dispatch_ms ?? snapshot.p95DispatchMs ?? campaign.p95DispatchMs),
       };
     }));
   }
@@ -273,24 +323,8 @@ export function App() {
     const template = templates.find((item) => item.id === wizard.templateId) ?? templates[0];
     const totalRecipients = audiencePreview(wizard.filter);
     const totalMessages = totalRecipients * wizard.selectedChannels.length;
-    try {
-      const result = await sendOpsCommand("campaign.create", {
-        name: wizard.name,
-        template_id: template.id,
-        filters: wizard.filter,
-        selected_channels: wizard.selectedChannels,
-        total_recipients: totalRecipients,
-      });
-      const backendCampaign = normalizeCampaign((result.campaign ?? result) as Record<string, unknown>);
-      setCampaigns((items) => [backendCampaign, ...items.filter((item) => item.id !== backendCampaign.id)]);
-      setSelectedCampaignId(backendCampaign.id);
-      setApiState("websocket commands");
-      addEvent("info", "campaign.started", `Backend campaign ${backendCampaign.name} started`, "campaign-service");
-      return;
-    } catch {
-      setApiState("local fallback");
-    }
-    const campaign: Campaign = {
+    const now = new Date().toISOString();
+    const optimisticCampaign: Campaign = {
       id: id("cmp"),
       name: wizard.name.trim() || "Новая кампания",
       templateId: template.id,
@@ -304,15 +338,36 @@ export function App() {
       success: 0,
       failed: 0,
       cancelled: 0,
-      p95DispatchMs: Math.min(1320, 720 + wizard.selectedChannels.length * 54),
-      createdAt: new Date().toISOString(),
-      startedAt: new Date().toISOString(),
+      p95DispatchMs: 0,
+      createdAt: now,
+      startedAt: now,
     };
-    setCampaigns((items) => [campaign, ...items]);
-    setDeliveries((items) => [...createDeliveries(campaign), ...items]);
-    setErrorGroups((items) => [...buildLocalErrorGroups(campaign), ...items]);
-    setSelectedCampaignId(campaign.id);
-    addEvent("info", "campaign.started", `Campaign ${campaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
+    setCampaigns((items) => [optimisticCampaign, ...items]);
+    setSelectedCampaignId(optimisticCampaign.id);
+    setScreen("dashboard");
+    addEvent("info", "campaign.started", `Campaign ${optimisticCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
+
+    try {
+      await sendOpsCommand("template.save", { template }).catch(() => undefined);
+      const result = await sendOpsCommand("campaign.create", {
+        name: wizard.name,
+        template_id: template.id,
+        filters: wizard.filter,
+        selected_channels: wizard.selectedChannels,
+        total_recipients: totalRecipients,
+      });
+      const backendCampaign = normalizeCampaign((result.campaign ?? result) as Record<string, unknown>);
+      setCampaigns((items) => [backendCampaign, ...items.filter((item) => item.id !== backendCampaign.id && item.id !== optimisticCampaign.id)]);
+      setSelectedCampaignId(backendCampaign.id);
+      setApiState("websocket commands");
+      return;
+    } catch {
+      setApiState("local fallback");
+    }
+    const fallbackCampaign = { ...optimisticCampaign, p95DispatchMs: Math.min(1320, 720 + wizard.selectedChannels.length * 54) };
+    setCampaigns((items) => items.map((campaign) => campaign.id === optimisticCampaign.id ? fallbackCampaign : campaign));
+    setDeliveries((items) => [...createDeliveries(fallbackCampaign), ...items]);
+    setErrorGroups((items) => [...buildLocalErrorGroups(fallbackCampaign), ...items]);
   }
 
   function updateTemplate(template: Template) {
@@ -347,7 +402,7 @@ export function App() {
     void sendOpsCommand("campaign.action", { campaign_id: targetCampaign.id, action }).then((message) => {
       if (message.campaign) {
         const updated = normalizeCampaign(message.campaign as Record<string, unknown>);
-        setCampaigns((items) => items.map((campaign) => campaign.id === updated.id ? updated : campaign));
+        setCampaigns((items) => items.map((campaign) => campaign.id === updated.id ? mergeCampaignUpdate(campaign, updated) : campaign));
       }
       setApiState("websocket commands");
     }).catch(() => setApiState("local fallback"));
@@ -366,10 +421,15 @@ export function App() {
             : [...new Set([...campaign.selectedChannels, "email"])];
           return { ...campaign, status: "retrying", selectedChannels, totalMessages: campaign.totalRecipients * selectedChannels.length, failed: 0 };
         }
+        if (action === "archive") return { ...campaign, archivedAt: new Date().toISOString() };
         const cancelled = Math.max(0, campaign.totalMessages - campaign.processed);
         return { ...campaign, status: "cancelled", cancelled, processed: campaign.totalMessages, finishedAt: new Date().toISOString() };
       }),
     );
+    if (action === "archive" && selectedCampaign?.id === targetCampaign.id) {
+      const nextActive = campaigns.find((campaign) => campaign.id !== targetCampaign.id && !campaign.archivedAt);
+      if (nextActive) setSelectedCampaignId(nextActive.id);
+    }
     if (action !== "start" && action !== "stop") {
       setErrorGroups((items) => items.filter((group) => group.campaignId !== targetCampaign.id));
     }
@@ -430,11 +490,11 @@ export function App() {
   }
 
   return (
-    <main className="appShell">
+    <main className="appShell" data-theme={theme} data-testid="theme-root" style={themeStyle(theme, customColor)}>
       <aside className="sidebar">
         <div className="brand">
           <span className="brandMark">N</span>
-          <span><strong>Norify</strong><small>Notification platform</small></span>
+          <span><strong>Norify</strong><small>Платформа уведомлений</small></span>
         </div>
         <nav className="navList">
           {visibleNavigation.map((item) => (
@@ -444,9 +504,11 @@ export function App() {
           ))}
         </nav>
         <div className="sessionBox">
+          <small>Сессия</small>
           <span>{userSession.email}</span>
           <strong>{userSession.role}</strong>
-          <button onClick={() => setSession(null)}><Icon name="logout" /> Logout</button>
+          <ThemePicker value={theme} customColor={customColor} onChange={setTheme} onCustomColorChange={setCustomColor} compact />
+          <button onClick={() => setSession(null)}><Icon name="logout" /> Выйти</button>
         </div>
       </aside>
 
@@ -458,10 +520,10 @@ export function App() {
           </div>
           <div className="topbarActions">
             <span className="apiState">{apiState}</span>
-            <select value={selectedCampaign?.id ?? ""} onChange={(event) => setSelectedCampaignId(event.target.value)}>
-              {campaigns.map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
+            <select value={selectedCampaign && !selectedCampaign.archivedAt ? selectedCampaign.id : ""} onChange={(event) => setSelectedCampaignId(event.target.value)} disabled={activeCampaigns.length === 0}>
+              {activeCampaigns.map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
             </select>
-            <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> New campaign</button>
+            <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
 
@@ -477,7 +539,7 @@ export function App() {
         )}
         {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} />}
         {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} />}
-        {screen === "templates" && <Templates templates={templates} onSave={updateTemplate} />}
+        {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
         {screen === "deliveries" && selectedCampaign && <Deliveries deliveries={deliveries.filter((delivery) => delivery.campaignId === selectedCampaign.id)} />}
         {screen === "stats" && <Stats campaigns={campaigns} channels={channels} />}
@@ -489,7 +551,54 @@ export function App() {
   );
 }
 
-function Login({ onLogin }: { onLogin: (session: { email: string; role: Role }) => void }) {
+function upsertCampaign(items: Campaign[], incoming: Campaign) {
+  const current = items.find((item) => item.id === incoming.id);
+  const campaign = current ? mergeCampaignUpdate(current, incoming) : incoming;
+  return [campaign, ...items.filter((item) => item.id !== incoming.id)];
+}
+
+function mergeCampaignUpdate(current: Campaign, incoming: Campaign): Campaign {
+  const emptyProgress = current.totalMessages > 0
+    && incoming.totalMessages <= 0
+    && incoming.processed <= 0
+    && incoming.success <= 0
+    && incoming.failed <= 0
+    && incoming.cancelled <= 0;
+  if (!emptyProgress) return incoming;
+  return {
+    ...incoming,
+    totalMessages: current.totalMessages,
+    processed: current.processed,
+    success: current.success,
+    failed: current.failed,
+    cancelled: current.cancelled,
+    p95DispatchMs: incoming.p95DispatchMs || current.p95DispatchMs,
+  };
+}
+
+function snapshotLooksEmpty(snapshot: Record<string, unknown>, current: Campaign) {
+  const hasProgressFields = ["total_messages", "totalMessages", "processed", "success", "failed", "cancelled"].some((field) => field in snapshot);
+  if (!hasProgressFields || current.totalMessages <= 0) return false;
+  return Number(snapshot.total_messages ?? snapshot.totalMessages ?? 0) <= 0
+    && Number(snapshot.processed ?? 0) <= 0
+    && Number(snapshot.success ?? 0) <= 0
+    && Number(snapshot.failed ?? 0) <= 0
+    && Number(snapshot.cancelled ?? 0) <= 0;
+}
+
+function Login({
+  theme,
+  customColor,
+  onThemeChange,
+  onCustomColorChange,
+  onLogin,
+}: {
+  theme: ThemeName;
+  customColor: string;
+  onThemeChange: (theme: ThemeName) => void;
+  onCustomColorChange: (color: string) => void;
+  onLogin: (session: { email: string; role: Role }) => void;
+}) {
   const [email, setEmail] = useState(credentials.admin.email);
   const [password, setPassword] = useState(credentials.admin.password);
   const [error, setError] = useState("");
@@ -511,23 +620,105 @@ function Login({ onLogin }: { onLogin: (session: { email: string; role: Role }) 
   }
 
   return (
-    <main className="loginShell">
-      <section className="loginPanel">
-        <div className="brand loginBrand"><span className="brandMark">N</span><span><strong>Norify</strong><small>Notification platform</small></span></div>
+    <main className="loginShell" data-theme={theme} data-testid="theme-root" style={themeStyle(theme, customColor)}>
+      <header className="loginWelcome">
+        <h1><span>Добро пожаловать в</span> <strong>Norify</strong></h1>
+      </header>
+      <div className="loginStage">
+      <section className="loginPanel formPanel" aria-label="Вход в личный кабинет">
+        <div className="brand loginBrand"><span className="brandMark">N</span><span><strong>Norify</strong><small>Платформа уведомлений</small></span></div>
         <form onSubmit={submit} className="loginForm">
-          <h1>Вход в кабинет</h1>
-          <label>Email<input value={email} onChange={(event) => setEmail(event.target.value)} /></label>
-          <label>Пароль<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <h2>Вход в личный кабинет</h2>
+          <label>Email<input placeholder="name@company.com" value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+          <label>
+            <span className="labelRow"><span>Пароль</span><button className="linkButton" type="button">Забыли пароль?</button></span>
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          </label>
           {error && <div className="inlineError">{error}</div>}
-          <button className="primary"><Icon name="login" /> Login</button>
+          <button className="primary loginAction">Продолжить</button>
+          <button type="button" className="softButton loginAction">Продолжить с Google</button>
         </form>
         <div className="loginHints">
           <button type="button" onClick={() => { setEmail(credentials.admin.email); setPassword(credentials.admin.password); }}>admin@example.com</button>
           <button type="button" onClick={() => { setEmail(credentials.manager.email); setPassword(credentials.manager.password); }}>manager@example.com</button>
         </div>
       </section>
+      <ThemePicker value={theme} customColor={customColor} onChange={onThemeChange} onCustomColorChange={onCustomColorChange} />
+      </div>
     </main>
   );
+}
+
+const themeOptions: { name: ThemeName; label: string }[] = [
+  { name: "sky", label: "Голубая тема" },
+  { name: "pink", label: "Розовая тема" },
+  { name: "mint", label: "Зеленая тема" },
+];
+
+function ThemePicker({
+  value,
+  customColor,
+  onChange,
+  onCustomColorChange,
+  compact = false,
+}: {
+  value: ThemeName;
+  customColor: string;
+  onChange: (theme: ThemeName) => void;
+  onCustomColorChange: (color: string) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "themePicker compact" : "themePicker"} aria-label="Выбор темы">
+      {themeOptions.map((item) => (
+        <button
+          key={item.name}
+          type="button"
+          className={`themeSwatch theme-${item.name}${value === item.name ? " active" : ""}`}
+          aria-label={item.label}
+          aria-pressed={value === item.name}
+          onClick={() => onChange(item.name)}
+        />
+      ))}
+      <label className={`themeSwatch customColorSwatch${value === "custom" ? " active" : ""}`}>
+        <input
+          type="color"
+          value={customColor}
+          aria-label="Пользовательский цвет"
+          onChange={(event) => {
+            onCustomColorChange(event.target.value);
+            onChange("custom");
+          }}
+        />
+      </label>
+    </div>
+  );
+}
+
+function themeStyle(theme: ThemeName, customColor: string): CSSProperties | undefined {
+  if (theme !== "custom") return undefined;
+  const rgb = hexToRgb(customColor);
+  if (!rgb) return undefined;
+  const { r, g, b } = rgb;
+  return {
+    "--accent": customColor,
+    "--accent-strong": customColor,
+    "--accent-soft": `rgba(${r}, ${g}, ${b}, 0.62)`,
+    "--accent-faint": `rgba(${r}, ${g}, ${b}, 0.24)`,
+    "--shadow": `0 24px 70px rgba(${r}, ${g}, ${b}, 0.16)`,
+    "--shadow-soft": `0 10px 30px rgba(${r}, ${g}, ${b}, 0.1)`,
+    "--page-gradient": `linear-gradient(180deg, rgba(${r}, ${g}, ${b}, 0.34) 0%, rgba(${r}, ${g}, ${b}, 0.12) 58%, #ffffff 100%)`,
+  } as CSSProperties;
+}
+
+function hexToRgb(value: string) {
+  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(value);
+  if (!match) return null;
+  return {
+    r: Number.parseInt(match[1], 16),
+    g: Number.parseInt(match[2], 16),
+    b: Number.parseInt(match[3], 16),
+  };
 }
 
 function Dashboard({
@@ -546,7 +737,8 @@ function Dashboard({
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
 }) {
   const percent = progressPercent(campaign);
-  const pending = Math.max(0, campaign.totalMessages - campaign.processed);
+  const totalMessages = effectiveTotalMessages(campaign);
+  const pending = Math.max(0, totalMessages - campaign.processed);
   return (
     <div className="opsGrid">
       <section className="panel campaignHeaderPanel wide">
@@ -561,8 +753,8 @@ function Dashboard({
           <CampaignPlayerControls campaign={campaign} onAction={onAction} />
           {campaign.failed > 0 && (
             <div className="recoveryActions" aria-label="Campaign recovery actions">
-              <button onClick={() => onAction("retry")}><Icon name="retry" /> Retry failed</button>
-              <button onClick={() => onAction("switch_channel")}><Icon name="switch" /> Switch channel</button>
+              <button onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
+              <button onClick={() => onAction("switch_channel")}><Icon name="switch" /> Сменить канал</button>
             </div>
           )}
         </div>
@@ -570,23 +762,23 @@ function Dashboard({
         <div className="progressStack">
           <div className="progressTop">
             <strong>{percent}%</strong>
-            <span>{campaign.processed.toLocaleString()} / {campaign.totalMessages.toLocaleString()}</span>
+            <span>{campaign.processed.toLocaleString()} / {totalMessages.toLocaleString()}</span>
           </div>
           <div className="progressLine"><div style={{ width: `${percent}%` }} /></div>
         </div>
 
         <div className="campaignMetaGrid">
-          <Metric label="Pending" value={pending.toLocaleString()} />
-          <Metric label="Success" value={campaign.success.toLocaleString()} tone="success" />
-          <Metric label="Failed" value={campaign.failed.toLocaleString()} tone="danger" />
-          <Metric label="Recipients" value={campaign.totalRecipients.toLocaleString()} />
-          <Metric label="Channels" value={String(campaign.selectedChannels.length)} />
-          <Metric label="p95 dispatch" value={formatP95Dispatch(campaign)} />
+          <Metric label="В очереди" value={pending.toLocaleString()} />
+          <Metric label="Успешно" value={campaign.success.toLocaleString()} tone="success" />
+          <Metric label="Ошибки" value={campaign.failed.toLocaleString()} tone="danger" />
+          <Metric label="Получатели" value={campaign.totalRecipients.toLocaleString()} />
+          <Metric label="Каналы" value={String(campaign.selectedChannels.length)} />
+          <Metric label="p95 enqueue" value={formatP95Dispatch(campaign)} />
         </div>
       </section>
 
       <section className="panel">
-        <div className="panelHeader"><h2>Dispatch lanes</h2><span>{campaign.selectedChannels.length} active</span></div>
+        <div className="panelHeader"><h2>Линии отправки</h2><span>{campaign.selectedChannels.length} активны</span></div>
         <div className="splitGrid compact">
           {campaign.selectedChannels.map((channel, index) => (
             <div key={channel} className="splitRow">
@@ -650,7 +842,7 @@ function ErrorGroupsPanel({
     <section className="panel errorGroupsPanel">
       <div className="panelHeader">
         <h2>Группы ошибок</h2>
-        <span className="queueMode"><Icon name="alert" /> realtime queue</span>
+        <span className="queueMode"><Icon name="alert" /> живая очередь</span>
       </div>
       {groups.length > 0 ? (
         <>
@@ -703,7 +895,7 @@ function ErrorGroupCard({
       </div>
       <p>{group.errorMessage || "Ошибка доставки без сообщения адаптера"}</p>
       <div className="groupMeta">
-        <span>attempt {group.maxAttempt}</span>
+        <span>попытка {group.maxAttempt}</span>
         <span>{formatDate(group.firstSeenAt)} → {formatDate(group.lastSeenAt)}</span>
       </div>
       <div className="groupImpact">{group.impact}</div>
@@ -735,18 +927,29 @@ function ErrorGroupCard({
   );
 }
 
-function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign") => void }) {
+function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void }) {
+  const [showArchive, setShowArchive] = useState(false);
+  const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
+  const archivedCampaigns = campaigns.filter((campaign) => campaign.archivedAt);
+  const visibleCampaigns = showArchive ? archivedCampaigns : activeCampaigns;
   return (
     <section className="panel wide campaignListPanel">
-      <div className="panelHeader"><h2>Campaign queue</h2><span>{campaigns.filter((campaign) => campaign.status === "running" || campaign.status === "retrying").length} active / {campaigns.length} total</span></div>
+      <div className="panelHeader">
+        <h2>Очередь кампаний</h2>
+        <div className="buttonRow tight">
+          <span>{activeCampaigns.length} активных / {archivedCampaigns.length} архив</span>
+          <button className={!showArchive ? "softButton" : ""} onClick={() => setShowArchive(false)}>Активные</button>
+          <button className={showArchive ? "softButton" : ""} onClick={() => setShowArchive(true)}>Показать архив</button>
+        </div>
+      </div>
       <div className="tableWrap">
         <table>
-          <thead><tr><th>Name</th><th>Status</th><th>Progress</th><th>Audience</th><th>Messages</th><th>p95</th><th /></tr></thead>
+          <thead><tr><th>Название</th><th>Статус</th><th>Прогресс</th><th>Аудитория</th><th>Сообщения</th><th>p95 enqueue</th><th /></tr></thead>
           <tbody>
-            {campaigns.map((campaign) => (
+            {visibleCampaigns.map((campaign) => (
               <tr key={campaign.id} className={selectedId === campaign.id ? "selectedRow" : ""}>
                 <td><button className="linkButton" onClick={() => onSelect(campaign.id)}>{campaign.name}</button></td>
-                <td><span className={`status status-${campaign.status}`}>{campaign.status}</span></td>
+                <td><span className={`status status-${campaign.archivedAt ? "archived" : campaign.status}`}>{campaign.archivedAt ? "архив" : campaign.status}</span></td>
                 <td>
                   <div className="tableProgress">
                     <div className="progressLine"><div style={{ width: `${progressPercent(campaign)}%` }} /></div>
@@ -757,12 +960,16 @@ function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns
                 <td>{campaign.totalMessages.toLocaleString()}</td>
                 <td>{formatP95Dispatch(campaign)}</td>
                 <td className="tableActions">
-                  {campaign.status === "created" && <button onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Start</button>}
-                  {campaign.failed > 0 && <button onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Retry</button>}
-                  {(campaign.status === "running" || campaign.status === "retrying") && <button className="danger" onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Cancel</button>}
+                  {!campaign.archivedAt && campaign.status === "created" && <button onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Старт</button>}
+                  {!campaign.archivedAt && campaign.failed > 0 && <button onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Повторить</button>}
+                  {!campaign.archivedAt && (campaign.status === "running" || campaign.status === "retrying") && <button className="danger" onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Отменить</button>}
+                  {!campaign.archivedAt && campaign.status !== "created" && <button onClick={() => onAction(campaign.id, "archive")}><Icon name="archive" /> В архив</button>}
                 </td>
               </tr>
             ))}
+            {visibleCampaigns.length === 0 && (
+              <tr><td colSpan={7}><div className="emptyState"><strong>{showArchive ? "Архив пуст" : "Нет активных кампаний"}</strong><span>Кампании из архива не удаляются физически и остаются доступны для просмотра.</span></div></td></tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -793,38 +1000,42 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
 
   return (
     <div className="createLayout">
-      <section className="panel">
-        <div className="panelHeader"><h2>Campaign</h2><Icon name="campaign" /></div>
-        <label>Name<input value={wizard.name} onChange={(event) => setWizard({ ...wizard, name: event.target.value })} /></label>
-        <label>Template
-          <select value={wizard.templateId} onChange={(event) => setWizard({ ...wizard, templateId: event.target.value })}>
-            {templates.map((template) => <option key={template.id} value={template.id}>{template.name} · v{template.version}</option>)}
-          </select>
-        </label>
-        <div className="templatePreview">{templates.find((template) => template.id === wizard.templateId)?.body}</div>
-      </section>
-
-      <section className="panel">
-        <div className="panelHeader"><h2>Audience</h2><strong>{preview.toLocaleString()}</strong></div>
-        <div className="fieldGrid">
-          <label>Min age<input type="number" value={wizard.filter.minAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, minAge: Number(event.target.value) } })} /></label>
-          <label>Max age<input type="number" value={wizard.filter.maxAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, maxAge: Number(event.target.value) } })} /></label>
+      <section className="panel formPanel">
+        <div className="panelHeader"><h2>Кампания</h2><Icon name="campaign" /></div>
+        <div className="formStack">
+          <label>Название<input value={wizard.name} onChange={(event) => setWizard({ ...wizard, name: event.target.value })} /></label>
+          <label>Шаблон
+            <select value={wizard.templateId} onChange={(event) => setWizard({ ...wizard, templateId: event.target.value })}>
+              {templates.map((template) => <option key={template.id} value={template.id}>{template.name} · v{template.version}</option>)}
+            </select>
+          </label>
+          <div className="templatePreview">{templates.find((template) => template.id === wizard.templateId)?.body}</div>
         </div>
-        <label>Gender
-          <select value={wizard.filter.gender} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, gender: event.target.value as AudienceFilter["gender"] } })}>
-            <option value="any">any</option><option value="female">female</option><option value="male">male</option>
-          </select>
-        </label>
-        <label>Location
-          <select value={wizard.filter.location} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, location: event.target.value } })}>
-            <option value="all">all</option><option value="Moscow">Moscow</option><option value="Kazan">Kazan</option><option value="Saint Petersburg">Saint Petersburg</option>
-          </select>
-        </label>
-        <label>Tags<input value={wizard.filter.tags.join(", ")} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, tags: event.target.value.split(",").map((tag) => tag.trim()).filter(Boolean) } })} /></label>
       </section>
 
-      <section className="panel">
-        <div className="panelHeader"><h2>Channels</h2><strong>{totalMessages.toLocaleString()}</strong></div>
+      <section className="panel formPanel">
+        <div className="panelHeader"><h2>Аудитория</h2><strong>{preview.toLocaleString()}</strong></div>
+        <div className="formStack">
+          <div className="fieldGrid">
+            <label>Возраст от<input type="number" value={wizard.filter.minAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, minAge: Number(event.target.value) } })} /></label>
+            <label>Возраст до<input type="number" value={wizard.filter.maxAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, maxAge: Number(event.target.value) } })} /></label>
+          </div>
+          <label>Пол
+            <select value={wizard.filter.gender} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, gender: event.target.value as AudienceFilter["gender"] } })}>
+              <option value="any">любой</option><option value="female">женский</option><option value="male">мужской</option>
+            </select>
+          </label>
+          <label>Город
+            <select value={wizard.filter.location} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, location: event.target.value } })}>
+              <option value="all">все</option><option value="Moscow">Москва</option><option value="Kazan">Казань</option><option value="Saint Petersburg">Санкт-Петербург</option>
+            </select>
+          </label>
+          <label>Теги<input value={wizard.filter.tags.join(", ")} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, tags: event.target.value.split(",").map((tag) => tag.trim()).filter(Boolean) } })} /></label>
+        </div>
+      </section>
+
+      <section className="panel formPanel">
+        <div className="panelHeader"><h2>Каналы</h2><strong>{totalMessages.toLocaleString()}</strong></div>
         <div className="choiceList">
           {enabledChannels.map((channel) => (
             <button key={channel.code} className={wizard.selectedChannels.includes(channel.code) ? "choice selected" : "choice"} onClick={() => toggleChannel(channel.code)}>
@@ -833,7 +1044,7 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
             </button>
           ))}
         </div>
-        <button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> Start campaign</button>
+        <div className="formActions"><button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> Запустить кампанию</button></div>
       </section>
     </div>
   );
@@ -982,7 +1193,7 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
   );
 }
 
-function Templates({ templates, onSave }: { templates: Template[]; onSave: (template: Template) => void }) {
+function Templates({ templates, variableOptions, onSave }: { templates: Template[]; variableOptions: TemplateVariable[]; onSave: (template: Template) => void }) {
   const initialTemplate = templates[0] ?? createBlankTemplate();
   const [editing, setEditing] = useState<Template>(initialTemplate);
   const [query, setQuery] = useState("");
@@ -1006,6 +1217,7 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
     const token = `{{${variable}}}`;
     setEditing((current) => ({
       ...current,
+      variables: normalizeVariables([...current.variables, variable]),
       body: current.body.includes(token) ? current.body : `${current.body.trimEnd()} ${token}`.trim(),
     }));
   }
@@ -1018,17 +1230,17 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
   return (
     <div>
       <div className="templatesTabs">
-        <button className={activeTab === "library" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("library")}>Template Library</button>
-        <button className={activeTab === "ai" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("ai")}>AI Generator</button>
+        <button className={activeTab === "library" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("library")}>Библиотека</button>
+        <button className={activeTab === "ai" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("ai")}>AI Генератор</button>
       </div>
       {activeTab === "ai" && <AIGenerator onApply={(text) => { setEditing({ ...createBlankTemplate(), body: text }); setActiveTab("library"); }} />}
       {activeTab === "library" && <div className="templatesLayout">
-      <section className="panel templateLibraryPanel">
+      <section className="panel formPanel templateLibraryPanel">
         <div className="panelHeader">
-          <h2>Template library</h2>
-          <span>{templates.length} total</span>
+          <h2>Библиотека шаблонов</h2>
+          <span>{templates.length} всего</span>
         </div>
-        <label>Search<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="name, text, variable" /></label>
+        <label>Поиск<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="название, текст, переменная" /></label>
         <div className="templateList">
           {visibleTemplates.map((template) => (
             <button key={template.id} className={editing.id === template.id ? "templateListItem selected" : "templateListItem"} onClick={() => setEditing(template)}>
@@ -1041,33 +1253,45 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
         </div>
       </section>
 
-      <section className="panel templateComposerPanel">
+      <section className="panel formPanel templateComposerPanel">
         <div className="panelHeader">
-          <h2>Template composer</h2>
-          <button onClick={() => setEditing(createBlankTemplate())}><Icon name="plus" /> New</button>
+          <h2>Редактор шаблона</h2>
+          <button onClick={() => setEditing(createBlankTemplate())}><Icon name="plus" /> Новый</button>
         </div>
         <div className="fieldGrid">
-          <label>Name<input value={editing.name} onChange={(event) => setEditing({ ...editing, name: event.target.value })} /></label>
-          <label>Version<input readOnly value={`v${editing.version}`} /></label>
+          <label>Название<input value={editing.name} onChange={(event) => setEditing({ ...editing, name: event.target.value })} /></label>
+          <label>Версия<input readOnly value={`v${editing.version}`} /></label>
         </div>
-        <label>Message body<textarea className="templateBodyInput" value={editing.body} onChange={(event) => setEditing({ ...editing, body: event.target.value })} /></label>
+        <label>Текст сообщения<textarea className="templateBodyInput" value={editing.body} onChange={(event) => setEditing({ ...editing, body: event.target.value })} /></label>
 
         <div className="templateVariableGrid">
           <div>
-            <div className="templateSectionLabel">Detected in body</div>
+            <div className="templateSectionLabel">Найдены в тексте</div>
             <div className="variableChips">
               {detectedVariables.length > 0 ? detectedVariables.map((variable) => <span key={variable} className="variableChip detected">{variable}</span>) : <span className="variableChip mutedChip">none</span>}
             </div>
           </div>
           <div>
-            <div className="templateSectionLabel">Declared variables</div>
-            <input value={declaredVariables.join(", ")} onChange={(event) => updateVariables(event.target.value)} />
+            <label className="compactLabel">Объявленные переменные
+              <input value={declaredVariables.join(", ")} onChange={(event) => updateVariables(event.target.value)} />
+            </label>
+          </div>
+        </div>
+
+        <div>
+          <div className="templateSectionLabel">Колонки PostgreSQL</div>
+          <div className="variableChips postgresColumns">
+            {variableOptions.map((variable) => (
+              <button key={`${variable.source}.${variable.name}`} className="variableChip actionChip" title={`${variable.source}.${variable.name}: ${variable.type}`} onClick={() => insertVariable(variable.name)}>
+                {variable.name}
+              </button>
+            ))}
           </div>
         </div>
 
         {declaredVariables.length > 0 && (
           <div>
-            <div className="templateSectionLabel">Quick insert</div>
+            <div className="templateSectionLabel">Быстрая вставка</div>
             <div className="variableChips">
               {declaredVariables.map((variable) => (
                 <button key={variable} className="variableChip actionChip" onClick={() => insertVariable(variable)}>{variable}</button>
@@ -1077,25 +1301,25 @@ function Templates({ templates, onSave }: { templates: Template[]; onSave: (temp
         )}
 
         <div className={isValid ? "templateValidation valid" : "templateValidation invalid"}>
-          {isValid ? "Ready to save" : missingVariables.length > 0 ? `Не объявлены: ${missingVariables.join(", ")}` : "Заполните название и текст"}
+          {isValid ? "Готово к сохранению" : missingVariables.length > 0 ? `Не объявлены: ${missingVariables.join(", ")}` : "Заполните название и текст"}
           {unusedVariables.length > 0 && <span>Не используются: {unusedVariables.join(", ")}</span>}
         </div>
 
-        <button className="primary saveTemplateButton" disabled={!isValid} onClick={saveTemplate}><Icon name="save" /> Save version</button>
+        <button className="primary saveTemplateButton" disabled={!isValid} onClick={saveTemplate}><Icon name="save" /> Сохранить версию</button>
       </section>
 
       <section className="panel templatePreviewPanel">
         <div className="panelHeader">
-          <h2>Live preview</h2>
-          <span>{editing.body.length} chars</span>
+          <h2>Живой предпросмотр</h2>
+          <span>{editing.body.length} символов</span>
         </div>
         <div className="messagePreview">
           <div className="messageBubble">{preview || "..."}</div>
         </div>
         <div className="templateMetaGrid">
-          <Metric label="variables" value={String(declaredVariables.length)} />
-          <Metric label="detected" value={String(detectedVariables.length)} />
-          <Metric label="version" value={`v${editing.version}`} />
+          <Metric label="переменные" value={String(declaredVariables.length)} />
+          <Metric label="найдены" value={String(detectedVariables.length)} />
+          <Metric label="версия" value={`v${editing.version}`} />
         </div>
         <div className="previewSamples">
           {Object.entries(templateSampleValues).slice(0, 4).map(([key, value]) => (
@@ -1114,6 +1338,15 @@ const templateSampleValues: Record<string, string> = {
   order_id: "48291",
   promo_code: "SPRING20",
   city: "Москва",
+  email: "user@example.com",
+  phone: "+79990000001",
+  telegram_id: "tg1001",
+  vk_id: "vk1001",
+  custom_app_id: "app1001",
+  age: "34",
+  gender: "female",
+  location: "Moscow",
+  tags: "vip, retail",
 };
 
 function createBlankTemplate(): Template {
@@ -1146,27 +1379,40 @@ function renderTemplatePreview(body: string): string {
 
 function Channels({ channels, role, onUpdate }: { channels: Channel[]; role: Role; onUpdate: (code: string, patch: Partial<Channel>) => void }) {
   return (
-    <section className="panel wide">
-      <div className="panelHeader"><h2>Channel registry</h2><span>{role === "admin" ? "live delivery stats" : "read only"}</span></div>
+    <section className="panel wide channelRegistryPanel">
+      <div className="panelHeader">
+        <h2>Реестр каналов</h2>
+        <span>{role === "admin" ? "Живая статистика доставки" : "Только чтение"}</span>
+      </div>
       <div className="channelGrid">
         {channels.map((channel) => (
-          <article key={channel.code} className={channel.degraded ? "channelCard degraded" : "channelCard"}>
-            <div className="channelTop"><strong>{channel.name}</strong><span className={channel.enabled ? "status status-running" : "status status-cancelled"}>{channel.enabled ? "enabled" : "disabled"}</span></div>
-            <div className="compactMetrics">
-              <Metric label="success" value={formatChannelSuccess(channel)} />
-              <Metric label="parallel" value={String(channel.maxParallelism)} />
-              <Metric label="avg attempt" value={formatAverageAttempt(channel)} />
+          <article key={channel.code} className={`channelCard${channel.degraded ? " degraded" : ""}${channel.enabled ? "" : " disabled"}`}>
+            <div className="channelTop">
+              <div className="channelName">
+                <strong>{channel.name}</strong>
+                <small>{channel.code}</small>
+              </div>
+              <span className={channel.enabled ? "status status-running" : "status status-cancelled"}>{channel.enabled ? "Включен" : "Отключен"}</span>
+            </div>
+            <div className="channelMetrics">
+              <Metric label="Успех доставки" value={formatChannelSuccess(channel)} />
+              <Metric label="Параллелизм" value={String(channel.maxParallelism)} />
+              <Metric label="Средняя попытка" value={formatAverageAttempt(channel)} />
+              <Metric label="Порог успеха" value={formatProbability(channel.successProbability)} />
             </div>
             <div className="channelStatsMeta">
-              <span>{(channel.deliveryTotal ?? 0).toLocaleString()} total</span>
-              <span>{(channel.deliverySent ?? 0).toLocaleString()} sent</span>
-              <span>{(channel.deliveryFailed ?? 0).toLocaleString()} failed</span>
-              <span>{(channel.deliveryQueued ?? 0).toLocaleString()} queued</span>
+              <span><small>Всего</small><strong>{(channel.deliveryTotal ?? 0).toLocaleString()}</strong></span>
+              <span><small>Отправлено</small><strong>{(channel.deliverySent ?? 0).toLocaleString()}</strong></span>
+              <span><small>Ошибки</small><strong>{(channel.deliveryFailed ?? 0).toLocaleString()}</strong></span>
+              <span><small>В очереди</small><strong>{(channel.deliveryQueued ?? 0).toLocaleString()}</strong></span>
             </div>
-            <label>Configured probability<input disabled={role !== "admin"} type="range" min="0.5" max="1" step="0.01" value={channel.successProbability} onChange={(event) => onUpdate(channel.code, { successProbability: Number(event.target.value) })} /></label>
+            <label className="channelProbability">
+              <span><b>Настроенная вероятность</b><strong>{formatProbability(channel.successProbability)}</strong></span>
+              <input disabled={role !== "admin"} type="range" min="0.5" max="1" step="0.01" value={channel.successProbability} onChange={(event) => onUpdate(channel.code, { successProbability: Number(event.target.value) })} />
+            </label>
             <div className="buttonRow">
-              <button disabled={role !== "admin"} onClick={() => onUpdate(channel.code, { enabled: !channel.enabled })}>{channel.enabled ? <Icon name="stop" /> : <Icon name="play" />} {channel.enabled ? "Disable" : "Enable"}</button>
-              <button disabled={role !== "admin"} onClick={() => onUpdate(channel.code, { degraded: !channel.degraded })}><Icon name="pulse" /> {channel.degraded ? "Clear" : "Degrade"}</button>
+              <button disabled={role !== "admin"} onClick={() => onUpdate(channel.code, { enabled: !channel.enabled })}>{channel.enabled ? <Icon name="stop" /> : <Icon name="play" />} {channel.enabled ? "Отключить" : "Включить"}</button>
+              <button disabled={role !== "admin"} onClick={() => onUpdate(channel.code, { degraded: !channel.degraded })}><Icon name="pulse" /> {channel.degraded ? "Стабилизировать" : "Снизить"}</button>
             </div>
           </article>
         ))}
@@ -1176,13 +1422,17 @@ function Channels({ channels, role, onUpdate }: { channels: Channel[]; role: Rol
 }
 
 function formatChannelSuccess(channel: Channel) {
-  if (!channel.deliveryTotal || channel.deliverySuccessRate === null || channel.deliverySuccessRate === undefined) return "no data";
+  if (!channel.deliveryTotal || channel.deliverySuccessRate === null || channel.deliverySuccessRate === undefined) return "Нет данных";
   return `${Math.round(channel.deliverySuccessRate * 100)}%`;
 }
 
 function formatAverageAttempt(channel: Channel) {
-  if (!channel.deliveryTotal || channel.averageAttempt === null || channel.averageAttempt === undefined) return "no data";
+  if (!channel.deliveryTotal || channel.averageAttempt === null || channel.averageAttempt === undefined) return "Нет данных";
   return channel.averageAttempt.toFixed(channel.averageAttempt >= 10 ? 0 : 1);
+}
+
+function formatProbability(value: number) {
+  return `${Math.round(value * 100)}%`;
 }
 
 function normalizeChannelPatch(raw: Record<string, unknown>): Partial<Channel> {
@@ -1248,10 +1498,10 @@ function optionalNumber(value: unknown): number | null {
 function Deliveries({ deliveries }: { deliveries: Delivery[] }) {
   return (
     <section className="panel wide">
-      <div className="panelHeader"><h2>Delivery results</h2><span>{deliveries.length} visible rows</span></div>
+      <div className="panelHeader"><h2>Результаты доставки</h2><span>{deliveries.length} строк</span></div>
       <div className="tableWrap">
         <table>
-          <thead><tr><th>User</th><th>Channel</th><th>Status</th><th>Attempt</th><th>Error</th><th>Finished</th></tr></thead>
+          <thead><tr><th>Пользователь</th><th>Канал</th><th>Статус</th><th>Попытка</th><th>Ошибка</th><th>Завершено</th></tr></thead>
           <tbody>
             {deliveries.map((delivery) => (
               <tr key={delivery.id}>
@@ -1276,14 +1526,14 @@ function Stats({ campaigns, channels }: { campaigns: Campaign[]; channels: Chann
     <div className="pageGrid">
       <section className="panel wide">
         <div className="stats">
-          <Metric label="total messages" value={totals.messages.toLocaleString()} />
-          <Metric label="success" value={totals.success.toLocaleString()} tone="success" />
-          <Metric label="failed" value={totals.failed.toLocaleString()} tone="danger" />
-          <Metric label="active campaigns" value={String(totals.active)} />
+          <Metric label="всего сообщений" value={totals.messages.toLocaleString()} />
+          <Metric label="успешно" value={totals.success.toLocaleString()} tone="success" />
+          <Metric label="ошибки" value={totals.failed.toLocaleString()} tone="danger" />
+          <Metric label="активные" value={String(totals.active)} />
         </div>
       </section>
       <section className="panel wide">
-        <div className="panelHeader"><h2>Channel health</h2><span>{channels.filter((channel) => channel.enabled).length} enabled</span></div>
+        <div className="panelHeader"><h2>Качество каналов</h2><span>{channels.filter((channel) => channel.enabled).length} включены</span></div>
         <div className="barChart">
           {channels.map((channel) => {
             const rate = channel.deliveryTotal && channel.deliverySuccessRate !== null && channel.deliverySuccessRate !== undefined ? channel.deliverySuccessRate : 0;
@@ -1301,14 +1551,16 @@ function Managers({ role, managers, onAdd }: { role: Role; managers: Manager[]; 
   if (role !== "admin") return <AccessDenied />;
   return (
     <div className="twoColumn">
-      <section className="panel">
-        <div className="panelHeader"><h2>Add manager</h2><Icon name="users" /></div>
-        <label>Email<input value={email} onChange={(event) => setEmail(event.target.value)} /></label>
-        <label>Role<select value={newRole} onChange={(event) => setNewRole(event.target.value as Role)}><option value="manager">manager</option><option value="admin">admin</option></select></label>
-        <button className="primary" onClick={() => onAdd(email, newRole)}><Icon name="plus" /> Add</button>
+      <section className="panel formPanel">
+        <div className="panelHeader"><h2>Добавить менеджера</h2><Icon name="users" /></div>
+        <div className="formStack">
+          <label>Email<input value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+          <label>Роль<select value={newRole} onChange={(event) => setNewRole(event.target.value as Role)}><option value="manager">manager</option><option value="admin">admin</option></select></label>
+        </div>
+        <div className="formActions"><button className="primary" onClick={() => onAdd(email, newRole)}><Icon name="plus" /> Добавить</button></div>
       </section>
       <section className="panel">
-        <div className="panelHeader"><h2>RBAC</h2><span>{managers.length} accounts</span></div>
+        <div className="panelHeader"><h2>RBAC</h2><span>{managers.length} аккаунтов</span></div>
         <div className="listStack">{managers.map((manager) => <div key={manager.id} className="listItem static"><span><strong>{manager.email}</strong><small>{manager.active ? "active" : "blocked"}</small></span><span>{manager.role}</span></div>)}</div>
       </section>
     </div>
@@ -1344,10 +1596,10 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
     <div className="pageGrid">
       <section className="panel wide">
         <div className="panelHeader">
-          <h2>Microservice readiness</h2>
+          <h2>Готовность микросервисов</h2>
           <div className="buttonRow tight">
             <span className="healthSummary">{readyCount} ready · {downCount} down</span>
-            <button onClick={() => void refreshHealth()} disabled={refreshing}><Icon name="pulse" /> Refresh</button>
+            <button onClick={() => void refreshHealth()} disabled={refreshing}><Icon name="pulse" /> Обновить</button>
           </div>
         </div>
         <div className="healthGrid">
@@ -1364,7 +1616,7 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
         </div>
         <div className="tableWrap healthTable">
           <table>
-            <thead><tr><th>Service</th><th>Status</th><th>Latency</th><th>Endpoint</th><th>Checked</th></tr></thead>
+            <thead><tr><th>Сервис</th><th>Статус</th><th>Задержка</th><th>Endpoint</th><th>Проверка</th></tr></thead>
             <tbody>
               {checks.map((check) => (
                 <tr key={check.id}>
@@ -1380,7 +1632,7 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
         </div>
       </section>
       <section className="panel wide">
-        <div className="panelHeader"><h2>Recent system events</h2><span>{events.length}</span></div>
+        <div className="panelHeader"><h2>Последние события</h2><span>{events.length}</span></div>
         <EventList events={events.slice(0, 5)} />
       </section>
     </div>
@@ -1388,7 +1640,7 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
 }
 
 function Logs({ events }: { events: SystemEvent[] }) {
-  return <section className="panel wide"><div className="panelHeader"><h2>System events</h2><span>structured logs</span></div><EventList events={events} /></section>;
+  return <section className="panel wide"><div className="panelHeader"><h2>Системные события</h2><span>структурные логи</span></div><EventList events={events} /></section>;
 }
 
 function EventList({ events }: { events: SystemEvent[] }) {
@@ -1396,11 +1648,11 @@ function EventList({ events }: { events: SystemEvent[] }) {
 }
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: "success" | "danger" }) {
-  return <div className={`metric ${tone ?? ""}`}><span>{label}</span><strong>{value}</strong></div>;
+  return <div className={`metric ${tone ?? ""}${value === "Нет данных" ? " emptyMetric" : ""}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 
 function AccessDenied() {
-  return <section className="panel"><div className="panelHeader"><h2>Forbidden</h2><Icon name="alert" /></div><p>Недостаточно прав для административной операции.</p></section>;
+  return <section className="panel"><div className="panelHeader"><h2>Нет доступа</h2><Icon name="alert" /></div><p>Недостаточно прав для административной операции.</p></section>;
 }
 
 function useLocalState<T>(key: string, initial: T): [T, Dispatch<SetStateAction<T>>] {
@@ -1509,6 +1761,7 @@ function formatLatency(value: number) {
 }
 
 function formatP95Dispatch(campaign: Campaign) {
+  if (campaign.p95DispatchMs === 1) return "<1 ms";
   if (campaign.p95DispatchMs > 0) return `${campaign.p95DispatchMs} ms`;
   if (campaign.status === "created") return "pending";
   if (campaign.status === "running" || campaign.status === "retrying") return "measuring";
@@ -1517,37 +1770,37 @@ function formatP95Dispatch(campaign: Campaign) {
 
 function titleFor(screen: Screen) {
   const titles: Record<Screen, string> = {
-    dashboard: "Campaign control",
-    campaigns: "Campaigns",
-    create: "Create campaign",
-    templates: "Templates",
-    channels: "Channels",
-    deliveries: "Deliveries",
-    stats: "Statistics",
-    managers: "Managers",
-    health: "Health",
-    logs: "System logs",
+    dashboard: "Панель управления",
+    campaigns: "Кампании",
+    create: "Создание кампании",
+    templates: "Шаблоны",
+    channels: "Каналы",
+    deliveries: "Доставки",
+    stats: "Статистика",
+    managers: "Менеджеры",
+    health: "Здоровье",
+    logs: "Системные логи",
   };
   return titles[screen];
 }
 
 function subtitleFor(screen: Screen) {
   const subtitles: Record<Screen, string> = {
-    dashboard: "Realtime dispatch, delivery status, and actionable failures.",
-    campaigns: "Queue, cancel, retry, and inspect campaign runs.",
-    create: "Audience, template, and channel selection in one flow.",
-    templates: "Versioned notification copy with variable validation.",
-    channels: "Adapter registry, limits, probabilities, and availability.",
-    deliveries: "Per-user and per-channel delivery results.",
-    stats: "Aggregated throughput and channel quality.",
-    managers: "Role-based manager administration.",
-    health: "Service readiness, queues, and websocket state.",
-    logs: "Audit and system events.",
+    dashboard: "Живая отправка, статусы доставки и точечная обработка ошибок.",
+    campaigns: "Очередь, запуск, повтор и контроль выполнения кампаний.",
+    create: "Аудитория, шаблон и каналы в одном потоке.",
+    templates: "Версионные тексты уведомлений с проверкой переменных.",
+    channels: "Реестр адаптеров, лимиты, вероятности и доступность.",
+    deliveries: "Результаты доставки по пользователям и каналам.",
+    stats: "Сводная пропускная способность и качество каналов.",
+    managers: "Управление менеджерами и ролями.",
+    health: "Готовность сервисов, очереди и websocket-состояние.",
+    logs: "Аудит и системные события.",
   };
   return subtitles[screen];
 }
 
-type IconName = "dashboard" | "campaign" | "plus" | "template" | "channel" | "table" | "chart" | "users" | "pulse" | "log" | "logout" | "login" | "alert" | "retry" | "switch" | "stop" | "play" | "save" | "cancel";
+type IconName = "dashboard" | "campaign" | "plus" | "template" | "channel" | "table" | "chart" | "users" | "pulse" | "log" | "logout" | "login" | "alert" | "retry" | "switch" | "stop" | "play" | "save" | "cancel" | "archive";
 
 function Icon({ name }: { name: IconName }) {
   const paths: Record<IconName, string> = {
@@ -1570,6 +1823,7 @@ function Icon({ name }: { name: IconName }) {
     play: "M8 5v14l11-7z",
     save: "M5 4h12l2 2v14H5zM8 4v6h8M8 18h8",
     cancel: "M6 6l12 12M18 6L6 18",
+    archive: "M4 7h16M6 7l1 12h10l1-12M9 11h6M8 4h8l1 3H7z",
   };
   return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d={paths[name]} /></svg>;
 }

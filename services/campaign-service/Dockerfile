@@ -5,7 +5,7 @@ COPY go.mod go.sum ./
 COPY packages/ packages/
 RUN go mod download
 COPY . .
-RUN go build -o /out/service ./services/campaign-service
+RUN go build -mod=vendor -o /out/service ./services/campaign-service
 FROM alpine:3.20
 COPY --from=build /out/service /service
 EXPOSE 8080

@@ -18,10 +18,19 @@ const (
 	QueueMessageSend       = "message.send.request"
 	QueueMessageRetry      = "message.send.retry"
 	QueueMessageDLQ        = "message.send.dlq"
+	QueueMessageResult     = "message.send.result"
+	QueueMessageError      = "message.send.error"
 	ExchangeMessageStatus  = "message.status.events"
 	ExchangeCampaignStatus = "campaign.status.events"
 	ExchangeMessageDLX     = "message.send.dlx"
 )
+
+type PublishOptions struct {
+	MessageID     string
+	CorrelationID string
+	Headers       amqp.Table
+	Priority      uint8
+}
 
 func Env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
@@ -111,7 +120,7 @@ func DeclareTopology(channel *amqp.Channel) error {
 			"x-message-ttl":             int32(5000),
 		},
 	}
-	queues := []string{QueueCampaignDispatch, QueueMessageSend, QueueMessageRetry, QueueMessageDLQ, ExchangeMessageStatus, ExchangeCampaignStatus}
+	queues := []string{QueueCampaignDispatch, QueueMessageSend, QueueMessageRetry, QueueMessageDLQ, QueueMessageResult, QueueMessageError, ExchangeMessageStatus, ExchangeCampaignStatus}
 	for _, queue := range queues {
 		if _, err := channel.QueueDeclare(queue, true, false, false, false, queueArgs[queue]); err != nil {
 			return err
@@ -131,17 +140,58 @@ func PublishJSON(ctx context.Context, channel *amqp.Channel, exchange, routingKe
 }
 
 func PublishJSONPriority(ctx context.Context, channel *amqp.Channel, exchange, routingKey string, priority uint8, payload any) error {
+	return PublishJSONWithOptions(ctx, channel, exchange, routingKey, payload, PublishOptions{Priority: priority})
+}
+
+func PublishJSONWithOptions(ctx context.Context, channel *amqp.Channel, exchange, routingKey string, payload any, options PublishOptions) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	return channel.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp.Persistent,
-		Priority:     priority,
-		Timestamp:    time.Now().UTC(),
-		Body:         body,
+		ContentType:   "application/json",
+		DeliveryMode:  amqp.Persistent,
+		Priority:      options.Priority,
+		MessageId:     options.MessageID,
+		CorrelationId: options.CorrelationID,
+		Headers:       options.Headers,
+		Timestamp:     time.Now().UTC(),
+		Body:          body,
 	})
+}
+
+func MessagePublishOptions(payload any) PublishOptions {
+	campaignID := ""
+	idempotencyKey := ""
+	switch value := payload.(type) {
+	case interface {
+		Campaign() string
+		Idempotency() string
+	}:
+		campaignID = value.Campaign()
+		idempotencyKey = value.Idempotency()
+	case struct {
+		CampaignID     string
+		IdempotencyKey string
+	}:
+		campaignID = value.CampaignID
+		idempotencyKey = value.IdempotencyKey
+	}
+	if campaignID == "" || idempotencyKey == "" {
+		raw, _ := json.Marshal(payload)
+		var probe struct {
+			CampaignID     string `json:"campaign_id"`
+			IdempotencyKey string `json:"idempotency_key"`
+		}
+		_ = json.Unmarshal(raw, &probe)
+		campaignID = probe.CampaignID
+		idempotencyKey = probe.IdempotencyKey
+	}
+	return PublishOptions{
+		MessageID:     idempotencyKey,
+		CorrelationID: campaignID,
+		Headers:       amqp.Table{"x-idempotency-key": idempotencyKey},
+	}
 }
 
 func DecodeJSON(delivery amqp.Delivery, dest any) error {

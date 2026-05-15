@@ -138,7 +138,13 @@ VALUES
   ('channel-vk', 'vk', 'VK', 0.8900, 2, 120, 100, 3),
   ('channel-max', 'max', 'MAX', 0.9300, 2, 140, 70, 2),
   ('channel-custom-app', 'custom_app', 'Custom App', 0.9800, 2, 45, 220, 3)
-ON CONFLICT (code) DO NOTHING;
+ON CONFLICT (code) DO UPDATE SET
+  name = EXCLUDED.name,
+  success_probability = EXCLUDED.success_probability,
+  min_delay_seconds = EXCLUDED.min_delay_seconds,
+  max_delay_seconds = EXCLUDED.max_delay_seconds,
+  max_parallelism = EXCLUDED.max_parallelism,
+  retry_limit = EXCLUDED.retry_limit;
 
 INSERT INTO users (id, email, phone, telegram_id, vk_id, custom_app_id, age, gender, location, tags)
 SELECT
