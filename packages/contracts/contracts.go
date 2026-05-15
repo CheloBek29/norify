@@ -23,6 +23,7 @@ type CampaignDispatchRequest struct {
 	TotalRecipients  int      `json:"total_recipients"`
 	SelectedChannels []string `json:"selected_channels"`
 	BatchSize        int      `json:"batch_size"`
+	StartRecipient   int      `json:"start_recipient,omitempty"`
 	RequestedAt      string   `json:"requested_at"`
 }
 

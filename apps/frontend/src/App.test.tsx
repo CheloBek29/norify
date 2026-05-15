@@ -257,6 +257,53 @@ describe("App", () => {
     expect(screen.queryAllByRole("heading", { name: "Backend запуск" })).toHaveLength(1);
   });
 
+  it("starts two new campaigns without queueing template save between create commands", async () => {
+    render(<App />);
+    login();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Создать" }));
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Первый запуск" } });
+    fireEvent.click(screen.getByRole("button", { name: /Запустить кампанию/i }));
+
+    const opsSocket = await waitFor(() => {
+      const socket = MockWebSocket.instances.find((item) => item.url.includes("/ws/ops") && item.sent.length > 0);
+      expect(socket).toBeTruthy();
+      return socket as MockWebSocket;
+    });
+    const firstRequest = JSON.parse(opsSocket.sent[0]);
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: firstRequest.id,
+        campaign: {
+          id: "cmp-first-backend",
+          name: "Первый запуск",
+          template_id: "tpl-reactivation",
+          template_name: "Реактивация клиента",
+          status: "running",
+          filters: {},
+          selected_channels: ["email", "sms", "telegram"],
+          total_recipients: 38640,
+          total_messages: 115920,
+          sent_count: 0,
+          success_count: 0,
+          failed_count: 0,
+          cancelled_count: 0,
+          created_at: "2026-05-15T12:00:00Z",
+        },
+      }) });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Новая кампания/i }));
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Второй запуск" } });
+    fireEvent.click(screen.getByRole("button", { name: /Запустить кампанию/i }));
+
+    await waitFor(() => {
+      const sentTypes = opsSocket.sent.map((item) => JSON.parse(item).type);
+      expect(sentTypes.slice(0, 2)).toEqual(["campaign.create", "campaign.create"]);
+    });
+  });
+
   it("renders player-style campaign controls and resumes after stop", async () => {
     render(<App />);
     login();

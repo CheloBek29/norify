@@ -251,6 +251,10 @@ func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		writeLookupError(w, err)
 		return
 	}
+	if !canStartCampaign(campaign.Status) {
+		httpapi.WriteJSON(w, http.StatusConflict, map[string]string{"error": "campaign_not_startable"})
+		return
+	}
 	now := time.Now().UTC()
 	_, err = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = COALESCE(started_at, $3), updated_at = now() WHERE id = $1`, id, campaigns.StatusRunning, now)
 	if err != nil {
@@ -258,12 +262,26 @@ func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err := publishDispatch(r.Context(), campaign); err != nil {
-		_, _ = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = NULL, updated_at = now() WHERE id = $1 AND status = $3`, id, campaigns.StatusCreated, campaigns.StatusRunning)
+		rollback := rollbackStateAfterStartFailure(campaign)
+		_, _ = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = $3, updated_at = now() WHERE id = $1 AND status = $4`, id, rollback.Status, rollback.StartedAt, campaigns.StatusRunning)
 		httpapi.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
 	campaign, _ = getCampaign(r.Context(), id)
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
+}
+
+type rollbackStartState struct {
+	Status    string
+	StartedAt *time.Time
+}
+
+func canStartCampaign(status string) bool {
+	return status == campaigns.StatusCreated || status == campaigns.StatusStopped
+}
+
+func rollbackStateAfterStartFailure(campaign Campaign) rollbackStartState {
+	return rollbackStartState{Status: campaign.Status, StartedAt: campaign.StartedAt}
 }
 
 func stopCampaign(w http.ResponseWriter, r *http.Request, id string) {
@@ -282,6 +300,7 @@ func stopCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		writeLookupError(w, err)
 		return
 	}
+	_ = publishCampaignProgress(r.Context(), campaign)
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
 }
 
@@ -303,6 +322,7 @@ func cancelCampaign(w http.ResponseWriter, r *http.Request, id string) {
 		writeLookupError(w, err)
 		return
 	}
+	_ = publishCampaignProgress(r.Context(), campaign)
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
 }
 
@@ -820,6 +840,8 @@ func scanCampaign(row pgx.Row) (Campaign, error) {
 		campaign.Snapshot.Status = campaigns.StatusCreated
 	} else if campaign.Status == campaigns.StatusRetrying {
 		campaign.Snapshot.Status = campaigns.StatusRetrying
+	} else if campaign.Status == campaigns.StatusStopped {
+		campaign.Snapshot.Status = campaigns.StatusStopped
 	}
 	return campaign, nil
 }

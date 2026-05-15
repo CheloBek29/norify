@@ -47,19 +47,59 @@ func consumeMessages(channel *amqp.Channel) {
 		slog.Error("consume message send", "error", err)
 		return
 	}
-	for delivery := range deliveries {
-		var req contracts.SendMessageRequest
-		if err := appruntime.DecodeJSON(delivery, &req); err != nil {
-			_ = delivery.Nack(false, false)
-			continue
+	results := make(chan deliveryResult)
+	inFlight := 0
+	for deliveries != nil || inFlight > 0 {
+		activeDeliveries := deliveries
+		if inFlight >= prefetch {
+			activeDeliveries = nil
 		}
-		if err := process(context.Background(), req); err != nil {
-			slog.Error("process send request", "campaign_id", req.CampaignID, "user_id", req.UserID, "channel", req.ChannelCode, "error", err)
-			_ = delivery.Nack(false, true)
-			continue
+		select {
+		case delivery, ok := <-activeDeliveries:
+			if !ok {
+				deliveries = nil
+				continue
+			}
+			inFlight++
+			go processDelivery(delivery, results)
+		case result := <-results:
+			inFlight--
+			ackDeliveryResult(result)
 		}
-		_ = delivery.Ack(false)
 	}
+}
+
+type deliveryResult struct {
+	delivery amqp.Delivery
+	request  contracts.SendMessageRequest
+	err      error
+	requeue  bool
+}
+
+func processDelivery(delivery amqp.Delivery, results chan<- deliveryResult) {
+	var req contracts.SendMessageRequest
+	if err := appruntime.DecodeJSON(delivery, &req); err != nil {
+		results <- deliveryResult{delivery: delivery, err: err}
+		return
+	}
+	if err := process(context.Background(), req); err != nil {
+		results <- deliveryResult{delivery: delivery, request: req, err: err, requeue: true}
+		return
+	}
+	results <- deliveryResult{delivery: delivery, request: req}
+}
+
+func ackDeliveryResult(result deliveryResult) {
+	if result.err == nil {
+		_ = result.delivery.Ack(false)
+		return
+	}
+	if result.requeue {
+		slog.Error("process send request", "campaign_id", result.request.CampaignID, "user_id", result.request.UserID, "channel", result.request.ChannelCode, "error", result.err)
+		_ = result.delivery.Nack(false, true)
+		return
+	}
+	_ = result.delivery.Nack(false, false)
 }
 
 func sendOnce(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +121,13 @@ func sendOnce(w http.ResponseWriter, r *http.Request) {
 func process(ctx context.Context, req contracts.SendMessageRequest) error {
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
+	}
+	active, err := campaignProcessingActive(ctx, req.CampaignID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil
 	}
 	config := channelConfig(ctx, req.ChannelCode)
 	registry := channels.NewRegistry([]channels.Config{config})
@@ -120,6 +167,21 @@ func process(ctx context.Context, req contracts.SendMessageRequest) error {
 		return appruntime.PublishJSON(ctx, mq, "", appruntime.QueueMessageDLQ, req)
 	}
 	return nil
+}
+
+func campaignProcessingActive(ctx context.Context, campaignID string) (bool, error) {
+	if db == nil || campaignID == "" {
+		return true, nil
+	}
+	var status string
+	if err := db.QueryRow(ctx, `SELECT status FROM campaigns WHERE id = $1`, campaignID).Scan(&status); err != nil {
+		return false, err
+	}
+	return canProcessCampaignStatus(status), nil
+}
+
+func canProcessCampaignStatus(status string) bool {
+	return status == campaigns.StatusRunning || status == campaigns.StatusRetrying
 }
 
 func campaignTotal(ctx context.Context, campaignID string) int {

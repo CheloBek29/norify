@@ -348,7 +348,6 @@ export function App() {
     addEvent("info", "campaign.started", `Campaign ${optimisticCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
 
     try {
-      await sendOpsCommand("template.save", { template }).catch(() => undefined);
       const result = await sendOpsCommand("campaign.create", {
         name: wizard.name,
         template_id: template.id,
