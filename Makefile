@@ -3,7 +3,7 @@ DEMO_COMPOSE ?= docker compose -f docker-compose.yml -f docker-compose.demo.yml
 PYTHON ?= python3
 
 KUBECTL ?= kubectl
-K8S_NAMESPACE ?= norify
+K8S_NAMESPACE ?= norify-demo
 K8S_UI_PORT ?= 3000
 K8S_FORWARD_PID ?= $(CURDIR)/.cache/k8s-frontend.port-forward.pid
 K8S_FORWARD_PORT ?= $(CURDIR)/.cache/k8s-frontend.port-forward.port
@@ -54,15 +54,27 @@ demo-metrics:
 	curl -fsS http://localhost:8090/metrics
 
 k8s-build:
-	docker compose build
+	docker build -t norify-auth-service:latest -f services/auth-service/Dockerfile .
+	docker build -t norify-user-service:latest -f services/user-service/Dockerfile .
+	docker build -t norify-template-service:latest -f services/template-service/Dockerfile .
+	docker build -t norify-channel-service:latest -f services/channel-service/Dockerfile .
+	docker build -t norify-campaign-service:latest -f services/campaign-service/Dockerfile .
+	docker build -t norify-dispatcher-service:latest -f services/dispatcher-service/Dockerfile .
+	docker build -t norify-sender-worker:latest -f services/sender-worker/Dockerfile .
+	docker build -t norify-notification-error-service:latest -f services/notification-error-service/Dockerfile .
+	docker build -t norify-stats-service:latest -f services/stats-service/Dockerfile .
+	docker build -t norify-ops-gateway:latest apps/ops-gateway
+	docker build -t norify-template-generator:latest services/template-generator
+	docker build -t norify-frontend:latest apps/frontend
 
-k8s-up: k8s-build k8s-apply k8s-migrate k8s-metrics k8s-wait k8s-smoke k8s-forward k8s-status k8s-url
+k8s-up: k8s-build k8s-apply k8s-migrate k8s-wait k8s-smoke k8s-forward k8s-status k8s-url
 
 k8s-down: k8s-forward-stop
 	-$(KUBECTL) delete namespace $(K8S_NAMESPACE)
 
 k8s-apply:
 	$(KUBECTL) apply -f deploy/k8s/namespace.yaml
+	$(KUBECTL) -n $(K8S_NAMESPACE) create configmap postgres-migrations --from-file=migrations --dry-run=client -o yaml | $(KUBECTL) apply -f -
 	$(KUBECTL) apply -f deploy/k8s/config.yaml
 	$(KUBECTL) apply -f deploy/k8s/stateful.yaml
 	$(KUBECTL) apply -f deploy/k8s/services.yaml
@@ -95,14 +107,7 @@ k8s-wait:
 	$(KUBECTL) -n $(K8S_NAMESPACE) rollout status deployment/frontend --timeout=180s
 
 k8s-smoke:
-	@echo "checking frontend -> backend links"
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/ops-gateway/ops/overview >/dev/null
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/stats-service/stats/overview >/dev/null
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/campaign-service/campaigns >/dev/null
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/channel-service/channels >/dev/null
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/template-service/templates >/dev/null
-	@$(KUBECTL) -n $(K8S_NAMESPACE) exec deploy/frontend -- wget -qO- http://127.0.0.1/api/sender-worker/worker/stats >/dev/null
-	@echo "k8s smoke ok"
+	K8S_NAMESPACE=$(K8S_NAMESPACE) $(PYTHON) tests/runtime/k8s_smoke.py
 
 k8s-forward:
 	@mkdir -p $(dir $(K8S_FORWARD_PID))

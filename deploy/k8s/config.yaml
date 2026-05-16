@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: norify-config
-  namespace: norify
+  namespace: norify-demo
 data:
   POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
   RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
@@ -15,7 +15,10 @@ data:
   DISPATCHER_SERVICE_URL: http://dispatcher-service:8080
   SENDER_SERVICE_URL: http://sender-worker:8080
   STATS_SERVICE_URL: http://stats-service:8080
+  TEMPLATE_GENERATOR_URL: http://template-generator:8003
   WORKER_CONTROL_MODE: kubernetes
+  SENDER_WORKER_REPLICAS: "3"
+  WORKER_CONTROL_MIN_REPLICAS: "1"
   WORKER_CONTROL_MAX_REPLICAS: "20"
   WORKER_K8S_DEPLOYMENT: sender-worker
   WORKER_K8S_HPA: sender-worker
@@ -26,7 +29,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: norify-secret
-  namespace: norify
+  namespace: norify-demo
 type: Opaque
 stringData:
   JWT_SECRET: change-me

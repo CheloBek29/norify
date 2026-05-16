@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: auth-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: auth-service}}
@@ -24,7 +24,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: auth-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: auth-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -33,7 +33,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: user-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: user-service}}
@@ -53,7 +53,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: user-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: user-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -62,7 +62,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: sender-worker
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 3
   selector: {matchLabels: {app: sender-worker}}
@@ -74,7 +74,7 @@ spec:
           image: postgres:16-alpine
           command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
         - name: wait-rabbitmq
-          image: busybox:1.36
+          image: postgres:16-alpine
           command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: worker
@@ -102,7 +102,7 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: sender-worker
-  namespace: norify
+  namespace: norify-demo
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -129,7 +129,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: sender-worker
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: sender-worker}
   ports: [{port: 8080, targetPort: 8080}]
@@ -138,13 +138,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ops-gateway
-  namespace: norify
+  namespace: norify-demo
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: sender-worker-scaler
-  namespace: norify
+  namespace: norify-demo
 rules:
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
@@ -155,11 +155,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: ops-gateway-sender-worker-scaler
-  namespace: norify
+  namespace: norify-demo
 subjects:
   - kind: ServiceAccount
     name: ops-gateway
-    namespace: norify
+    namespace: norify-demo
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -169,7 +169,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: template-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: template-service}}
@@ -193,7 +193,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: template-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: template-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -202,7 +202,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: channel-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: channel-service}}
@@ -226,7 +226,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: channel-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: channel-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -235,7 +235,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: campaign-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: campaign-service}}
@@ -247,7 +247,7 @@ spec:
           image: postgres:16-alpine
           command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
         - name: wait-rabbitmq
-          image: busybox:1.36
+          image: postgres:16-alpine
           command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
@@ -262,7 +262,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: campaign-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: campaign-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -271,7 +271,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: dispatcher-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: dispatcher-service}}
@@ -280,7 +280,7 @@ spec:
     spec:
       initContainers:
         - name: wait-rabbitmq
-          image: busybox:1.36
+          image: postgres:16-alpine
           command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
@@ -295,7 +295,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: dispatcher-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: dispatcher-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -304,7 +304,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: notification-error-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: notification-error-service}}
@@ -323,7 +323,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: notification-error-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: notification-error-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -332,7 +332,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: stats-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: stats-service}}
@@ -344,7 +344,7 @@ spec:
           image: postgres:16-alpine
           command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
         - name: wait-rabbitmq
-          image: busybox:1.36
+          image: postgres:16-alpine
           command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
@@ -361,7 +361,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: stats-service
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: stats-service}
   ports: [{port: 8080, targetPort: 8080}]
@@ -369,8 +369,39 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: template-generator
+  namespace: norify-demo
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: template-generator}}
+  template:
+    metadata: {labels: {app: template-generator}}
+    spec:
+      containers:
+        - name: service
+          image: norify-template-generator:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8003}]
+          env:
+            - {name: MISTRAL_API_KEY, value: ""}
+            - {name: MISTRAL_MODEL, value: "mistral-small-latest"}
+          livenessProbe: {httpGet: {path: /health, port: 8003}}
+          readinessProbe: {httpGet: {path: /health, port: 8003}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: template-generator
+  namespace: norify-demo
+spec:
+  selector: {app: template-generator}
+  ports: [{port: 8003, targetPort: 8003}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: ops-gateway
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: ops-gateway}}
@@ -395,7 +426,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ops-gateway
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: ops-gateway}
   ports: [{port: 8080, targetPort: 8080}]
@@ -404,7 +435,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 2
   selector: {matchLabels: {app: frontend}}
@@ -421,7 +452,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: frontend
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: frontend}
   ports: [{port: 80, targetPort: 80}]

@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: postgres
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 1
   selector: {matchLabels: {app: postgres}}
@@ -17,14 +17,22 @@ spec:
             - {name: POSTGRES_DB, value: norify}
             - {name: POSTGRES_USER, value: norify}
             - {name: POSTGRES_PASSWORD, value: norify}
+          volumeMounts:
+            - name: postgres-migrations
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
           readinessProbe:
             exec: {command: ["pg_isready", "-U", "norify", "-d", "norify"]}
+      volumes:
+        - name: postgres-migrations
+          configMap:
+            name: postgres-migrations
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: postgres}
   ports: [{port: 5432, targetPort: 5432}]
@@ -33,7 +41,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rabbitmq
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 1
   selector: {matchLabels: {app: rabbitmq}}
@@ -69,7 +77,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rabbitmq
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: rabbitmq}
   ports:
@@ -80,7 +88,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
-  namespace: norify
+  namespace: norify-demo
 spec:
   replicas: 1
   selector: {matchLabels: {app: redis}}
@@ -98,7 +106,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: redis
-  namespace: norify
+  namespace: norify-demo
 spec:
   selector: {app: redis}
   ports: [{port: 6379, targetPort: 6379}]
