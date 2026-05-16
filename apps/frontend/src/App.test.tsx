@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, newsletterMarkdownToHtml } from "./App";
 
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
@@ -593,6 +593,16 @@ describe("App", () => {
 
     expect((screen.getByLabelText("Текст сообщения") as HTMLTextAreaElement).value).toContain("{{email}}");
     expect((screen.getByLabelText("Объявленные переменные") as HTMLInputElement).value).toContain("email");
+  });
+
+  it("escapes generated newsletter preview html before rendering", () => {
+    const html = newsletterMarkdownToHtml("<img src=x onerror=alert(1)>\n[bad](javascript:alert(1))\n**ok**");
+
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain('<a href="#">bad</a>');
+    expect(html).toContain("<strong>ok</strong>");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("javascript:");
   });
 
   it("applies the polished form surface to every editable workflow", async () => {

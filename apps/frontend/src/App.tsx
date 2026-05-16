@@ -1337,10 +1337,160 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
   );
 }
 
+const TEMPLATE_GENERATOR_URL = "http://localhost:8091";
+
+type AIStyle = "professional" | "creative" | "luxury" | "minimal" | "ecommerce";
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function safeNewsletterHref(value: string): string {
+  const trimmed = value.trim();
+  return /^https?:\/\//i.test(trimmed) ? escapeHtml(trimmed) : "#";
+}
+
+export function newsletterMarkdownToHtml(markdown: string): string {
+  const lines = markdown.split("\n");
+  const out: string[] = [];
+  let inList = false;
+
+  for (const raw of lines) {
+    if (/^(\*\*)?subject/i.test(raw.trim())) continue;
+
+    let line = escapeHtml(raw)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*(.+?)\*/g, "<em>$1</em>")
+      .replace(/\[(.+?)\]\((.+?)\)/g, (_match, text: string, href: string) => `<a href="${safeNewsletterHref(href)}">${text}</a>`);
+
+    const hMatch = line.match(/^#{1,3}\s+(.+)/);
+    if (hMatch) {
+      if (inList) { out.push("</ul>"); inList = false; }
+      out.push(`<h3>${hMatch[1]}</h3>`);
+      continue;
+    }
+
+    if (line.trim() === "") {
+      if (inList) { out.push("</ul>"); inList = false; }
+      continue;
+    }
+
+    const listMatch = line.match(/^[-*•]\s+(.+)/) || line.match(/^([✅✔️▶️➡️🔹🔸💡📌⭐🌟])\s+(.+)/);
+    if (listMatch) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      const content = listMatch[2] ?? listMatch[1];
+      const prefix = listMatch[2] ? listMatch[1] + " " : "";
+      out.push(`<li>${prefix}${content}</li>`);
+      continue;
+    }
+
+    if (inList) { out.push("</ul>"); inList = false; }
+    out.push(`<p>${line}</p>`);
+  }
+
+  if (inList) out.push("</ul>");
+  return out.join("\n");
+}
+
+function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
+  const [step, setStep] = useState<1 | 2>(1);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [taskDesc, setTaskDesc] = useState("");
+  const [style, setStyle] = useState<AIStyle>("professional");
+  const [generatedText, setGeneratedText] = useState("");
+  const [editMode, setEditMode] = useState(false);
+
+  async function handleGenerateText() {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`${TEMPLATE_GENERATOR_URL}/api/generate-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_description: taskDesc, style }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Generation failed");
+      setGeneratedText(data.text);
+      setEditMode(false);
+      setStep(2);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="aiGenerator">
+      <div className="aiSteps">
+        {([1, 2] as const).map((s) => (
+          <div key={s} className={`aiStep${step === s ? " active" : step > s ? " done" : ""}`}>
+            <span>{s}</span>
+            <p>{s === 1 ? "Описание" : "Результат"}</p>
+          </div>
+        ))}
+      </div>
+
+      {error && <div className="aiError">{error}</div>}
+
+      {step === 1 && (
+        <div className="aiPanel">
+          <h3>Опишите задачу для рассылки</h3>
+          <label>Описание
+            <textarea value={taskDesc} onChange={(e) => setTaskDesc(e.target.value)} rows={5}
+              placeholder="Пример: Создай рассылку для интернет-магазина. Скидка 30% на смартфоны. Аудитория: 18-35 лет." />
+          </label>
+          <label>Стиль
+            <select value={style} onChange={(e) => setStyle(e.target.value as AIStyle)}>
+              <option value="professional">Профессиональный</option>
+              <option value="creative">Креативный</option>
+              <option value="luxury">Люкс</option>
+              <option value="minimal">Минимализм</option>
+              <option value="ecommerce">E-commerce</option>
+            </select>
+          </label>
+          <button className="primary" disabled={taskDesc.length < 10 || loading} onClick={handleGenerateText}>
+            {loading ? "Генерирую..." : "Сгенерировать текст →"}
+          </button>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="aiPanel">
+          <div className="aiTextHeader">
+            <h3>Готовый текст рассылки</h3>
+            <button className="aiEditToggle" onClick={() => setEditMode(!editMode)}>
+              {editMode ? "Предпросмотр" : "Редактировать"}
+            </button>
+          </div>
+          {editMode ? (
+            <textarea className="aiTextarea" value={generatedText} onChange={(e) => setGeneratedText(e.target.value)} rows={14} />
+          ) : (
+            <div className="aiTextPreview" dangerouslySetInnerHTML={{ __html: newsletterMarkdownToHtml(generatedText) }} />
+          )}
+          <div className="aiActions">
+            <button onClick={() => { setStep(1); setGeneratedText(""); }}>← Назад</button>
+            <button onClick={() => handleGenerateText()} disabled={loading}>{loading ? "Генерирую..." : "Перегенерировать"}</button>
+            <button className="primary" onClick={() => onApply(generatedText)}>Использовать текст →</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Templates({ templates, variableOptions, onSave }: { templates: Template[]; variableOptions: TemplateVariable[]; onSave: (template: Template) => void }) {
   const initialTemplate = templates[0] ?? createBlankTemplate();
   const [editing, setEditing] = useState<Template>(initialTemplate);
   const [query, setQuery] = useState("");
+  const [activeTab, setActiveTab] = useState<"library" | "ai">("library");
   const declaredVariables = normalizeVariables(editing.variables.join(", "));
   const detectedVariables = extractTemplateVariables(editing.body);
   const missingVariables = detectedVariables.filter((variable) => !declaredVariables.includes(variable));
@@ -1371,7 +1521,13 @@ function Templates({ templates, variableOptions, onSave }: { templates: Template
   }
 
   return (
-    <div className="templatesLayout">
+    <div>
+      <div className="templatesTabs">
+        <button className={activeTab === "library" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("library")}>Библиотека</button>
+        <button className={activeTab === "ai" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("ai")}>AI Генератор</button>
+      </div>
+      {activeTab === "ai" && <AIGenerator onApply={(text) => { setEditing({ ...createBlankTemplate(), body: text }); setActiveTab("library"); }} />}
+      {activeTab === "library" && <div className="templatesLayout">
       <section className="panel formPanel templateLibraryPanel">
         <div className="panelHeader">
           <h2>Библиотека шаблонов</h2>
@@ -1464,6 +1620,7 @@ function Templates({ templates, variableOptions, onSave }: { templates: Template
           ))}
         </div>
       </section>
+    </div>}
     </div>
   );
 }

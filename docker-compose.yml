@@ -195,6 +195,32 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  template-generator:
+    build:
+      context: ./services/template-generator
+      dockerfile: Dockerfile
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: mistral:7b
+    ports:
+      - "8091:8003"
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+
   frontend:
     image: norify-frontend:latest
     restart: unless-stopped
@@ -202,3 +228,6 @@ services:
       context: ./apps/frontend
     ports:
       - "3000:80"
+
+volumes:
+  ollama_data:
