@@ -31,6 +31,37 @@ function login() {
   fireEvent.click(screen.getByRole("button", { name: "Продолжить" }));
 }
 
+async function lastOpsRequest() {
+  const opsSocket = await waitFor(() => {
+    const socket = MockWebSocket.instances.find((item) => item.url.includes("/ws/ops") && item.sent.length > 0);
+    expect(socket).toBeTruthy();
+    return socket as MockWebSocket;
+  });
+  return { opsSocket, request: JSON.parse(opsSocket.sent[opsSocket.sent.length - 1]) };
+}
+
+function campaignPayload(overrides: Record<string, unknown>) {
+  return {
+    id: "cmp-spring",
+    name: "Весенняя реактивация",
+    template_id: "tpl-reactivation",
+    template_name: "Реактивация клиента",
+    status: "running",
+    filters: {},
+    selected_channels: ["email", "telegram", "custom_app"],
+    total_recipients: 50000,
+    total_messages: 150000,
+    sent_count: 5120,
+    success_count: 4781,
+    failed_count: 339,
+    cancelled_count: 0,
+    p95_dispatch_ms: 942,
+    created_at: "2026-05-13T08:55:00Z",
+    started_at: "2026-05-13T09:00:00Z",
+    ...overrides,
+  };
+}
+
 describe("App", () => {
   afterEach(() => {
     cleanup();
@@ -106,6 +137,17 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Вставить/i }));
 
+    const { opsSocket, request } = await lastOpsRequest();
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "error_group.resolved",
+        request_id: request.id,
+        group_id: "telegram-timeout",
+        queued: 339,
+        campaign: campaignPayload({ failed_count: 0 }),
+      }) });
+    });
+
     await waitFor(() => expect(screen.queryByText("Telegram adapter timeout")).toBeNull());
     expect(screen.getByText("Нет активных групп ошибок")).toBeTruthy();
     expect(screen.getByText(/Основная отправка продолжается/i)).toBeTruthy();
@@ -152,6 +194,24 @@ describe("App", () => {
 
     fireEvent.click(within(row as HTMLTableRowElement).getByRole("button", { name: /Старт/i }));
 
+    const { opsSocket, request } = await lastOpsRequest();
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: request.id,
+        campaign: campaignPayload({
+          id: "cmp-admin",
+          name: "Админское уведомление",
+          status: "running",
+          selected_channels: ["email", "sms", "telegram", "whatsapp", "vk", "custom_app"],
+          total_messages: 300000,
+          sent_count: 0,
+          success_count: 0,
+          failed_count: 0,
+        }),
+      }) });
+    });
+
     await waitFor(() => expect(within(row as HTMLTableRowElement).getByText("running")).toBeTruthy());
   });
 
@@ -165,6 +225,15 @@ describe("App", () => {
     expect(row).toBeTruthy();
 
     fireEvent.click(within(row as HTMLTableRowElement).getByRole("button", { name: /В архив/i }));
+
+    const { opsSocket, request } = await lastOpsRequest();
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: request.id,
+        campaign: campaignPayload({ archived_at: "2026-05-15T12:00:00Z" }),
+      }) });
+    });
 
     await waitFor(() => expect(screen.queryByRole("button", { name: "Весенняя реактивация" })).toBeNull());
     expect(screen.getByText(/1 актив/i)).toBeTruthy();
@@ -184,10 +253,24 @@ describe("App", () => {
     expect(row).toBeTruthy();
     fireEvent.click(within(row as HTMLTableRowElement).getByRole("button", { name: /Старт/i }));
 
-    await waitFor(() => {
-      const opsSocket = MockWebSocket.instances.find((socket) => socket.url.includes("/ws/ops"));
-      const messages = opsSocket?.sent.map((item) => JSON.parse(item));
-      expect(messages?.some((message) => message.type === "campaign.action" && message.payload.action === "start")).toBe(true);
+    const { opsSocket, request } = await lastOpsRequest();
+    expect(request.type).toBe("campaign.action");
+    expect(request.payload.action).toBe("start");
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: request.id,
+        campaign: campaignPayload({
+          id: "cmp-admin",
+          name: "Админское уведомление",
+          status: "running",
+          selected_channels: ["email", "sms", "telegram", "whatsapp", "vk", "custom_app"],
+          total_messages: 300000,
+          sent_count: 0,
+          success_count: 0,
+          failed_count: 0,
+        }),
+      }) });
     });
     expect(screen.getByRole("heading", { name: "Кампании" })).toBeTruthy();
     await waitFor(() => expect(within(row as HTMLTableRowElement).getByText("running")).toBeTruthy());
@@ -201,15 +284,30 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Моментальный запуск" } });
     fireEvent.click(screen.getByRole("button", { name: /Запустить кампанию/i }));
 
+    const { opsSocket, request } = await lastOpsRequest();
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: request.id,
+        campaign: campaignPayload({
+          id: "cmp-instant",
+          name: "Моментальный запуск",
+          status: "running",
+          total_recipients: 38640,
+          total_messages: 115920,
+          sent_count: 0,
+          success_count: 0,
+          failed_count: 0,
+        }),
+      }) });
+    });
+
     expect(await screen.findByRole("heading", { name: "Панель управления" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Моментальный запуск" })).toBeTruthy();
     expect(screen.getByText("running")).toBeTruthy();
     expect(screen.getByText("0 / 115,920")).toBeTruthy();
-    await waitFor(() => {
-      const opsSocket = MockWebSocket.instances.find((socket) => socket.url.includes("/ws/ops"));
-      const messages = opsSocket?.sent.map((item) => JSON.parse(item));
-      expect(messages?.some((message) => message.type === "campaign.create" && message.payload.name === "Моментальный запуск")).toBe(true);
-    });
+    expect(request.type).toBe("campaign.create");
+    expect(request.payload.name).toBe("Моментальный запуск");
   });
 
   it("replaces the optimistic campaign with the started backend campaign", async () => {
@@ -317,6 +415,15 @@ describe("App", () => {
 
     fireEvent.click(within(controls).getByRole("button", { name: /Остановить/i }));
 
+    let ops = await lastOpsRequest();
+    await act(async () => {
+      ops.opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: ops.request.id,
+        campaign: campaignPayload({ status: "stopped" }),
+      }) });
+    });
+
     await waitFor(() => expect(screen.getByText("stopped")).toBeTruthy());
     expect(within(controls).getByRole("button", { name: /Продолжить/i })).toBeTruthy();
     expect(screen.getByText("Telegram adapter timeout")).toBeTruthy();
@@ -372,6 +479,15 @@ describe("App", () => {
     expect(screen.getByText("5,120 / 150,000")).toBeTruthy();
 
     fireEvent.click(within(controls).getByRole("button", { name: /Продолжить/i }));
+
+    ops = await lastOpsRequest();
+    await act(async () => {
+      ops.opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "campaign.upsert",
+        request_id: ops.request.id,
+        campaign: campaignPayload({ status: "running" }),
+      }) });
+    });
 
     await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
     expect(screen.getByText("5,120 / 150,000")).toBeTruthy();

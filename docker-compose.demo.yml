@@ -1,0 +1,12 @@
+services:
+  postgres:
+    ports: !override
+      - "15432:5432"
+
+  sender-worker:
+    environment:
+      WORKER_MIN_POOL: 5
+      WORKER_MAX_POOL: 5
+      WORKER_PREFETCH: 20
+      CHANNEL_STUB_MIN_DELAY_SECONDS: 1
+      CHANNEL_STUB_MAX_DELAY_SECONDS: 3

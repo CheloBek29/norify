@@ -546,7 +546,10 @@ function optionalNumber(value: unknown): number | null {
 }
 
 function decodeClaims(token: string): { email: string; role: Role } {
-  const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+  const parts = token.split(".");
+  const encodedPayload = parts.length >= 3 ? parts[1] : parts[0];
+  if (!encodedPayload) throw new Error("invalid_token");
+  const payload = encodedPayload.replace(/-/g, "+").replace(/_/g, "/");
   const padded = payload.padEnd(Math.ceil(payload.length / 4) * 4, "=");
   const claims = JSON.parse(window.atob(padded));
   return { email: claims.email, role: claims.role };
