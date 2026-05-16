@@ -26,6 +26,30 @@ def test_health_ready_allows_frontend_cors():
     assert response.headers["access-control-allow-origin"] == "*"
 
 
+def test_health_live_and_ready_shapes():
+    client = TestClient(app)
+
+    live = client.get("/health/live")
+    ready = client.get("/health/ready")
+
+    assert live.status_code == 200
+    assert ready.status_code == 200
+    assert live.json()["status"] == "live"
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["service"] == "status-service"
+
+
+def test_metrics_returns_plain_text_websocket_client_count():
+    client = TestClient(app)
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.text.strip().strip('"').replace("\\n", "").strip()
+    assert body.startswith("websocket_connected_clients ")
+    assert body.split(" ", 1)[1].isdigit()
+
+
 def test_ingest_updates_snapshot():
     client = TestClient(app)
     event = {

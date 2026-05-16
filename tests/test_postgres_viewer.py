@@ -14,9 +14,9 @@ class PostgresViewerConfigTest(unittest.TestCase):
         compose = read_file("docker-compose.yml")
 
         self.assertIn("  postgres-viewer:", compose)
-        self.assertIn("    image: adminer:4.8.1", compose)
-        self.assertIn('      - "8089:8080"', compose)
-        self.assertIn("      ADMINER_DEFAULT_SERVER: postgres", compose)
+        self.assertIn("    image: sosedoff/pgweb:latest", compose)
+        self.assertIn('      - "8089:8081"', compose)
+        self.assertIn("      - --url=postgres://norify:norify@postgres:5432/norify?sslmode=disable", compose)
         self.assertIn("      postgres:", compose)
         self.assertIn("        condition: service_healthy", compose)
 
@@ -24,8 +24,5 @@ class PostgresViewerConfigTest(unittest.TestCase):
         readme = read_file("README.md")
 
         self.assertIn("http://localhost:8089", readme)
-        self.assertIn("`System`: `PostgreSQL`", readme)
-        self.assertIn("`Server`: `postgres`", readme)
-        self.assertIn("`Username`: `norify`", readme)
-        self.assertIn("`Password`: `norify`", readme)
-        self.assertIn("`Database`: `norify`", readme)
+        self.assertIn("pgweb", readme)
+        self.assertIn("postgres://norify:norify@postgres:5432/norify?sslmode=disable", readme)

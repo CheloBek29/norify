@@ -31,6 +31,15 @@ function login() {
   fireEvent.click(screen.getByRole("button", { name: "Продолжить" }));
 }
 
+async function lastOpsRequest() {
+  const opsSocket = await waitFor(() => {
+    const socket = MockWebSocket.instances.find((item) => item.url.includes("/ws/ops") && item.sent.length > 0);
+    expect(socket).toBeTruthy();
+    return socket as MockWebSocket;
+  });
+  return { opsSocket, request: JSON.parse(opsSocket.sent[opsSocket.sent.length - 1]) };
+}
+
 describe("App", () => {
   afterEach(() => {
     cleanup();
@@ -210,6 +219,35 @@ describe("App", () => {
       const messages = opsSocket?.sent.map((item) => JSON.parse(item));
       expect(messages?.some((message) => message.type === "campaign.create" && message.payload.name === "Моментальный запуск")).toBe(true);
     });
+  });
+
+  it.fails("does not create a fake local campaign when backend create fails", async () => {
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Создать" }));
+
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Backend недоступен" } });
+    fireEvent.click(screen.getByRole("button", { name: /Запустить кампанию/i }));
+
+    const { opsSocket, request } = await lastOpsRequest();
+    await act(async () => {
+      opsSocket.onmessage?.({ data: JSON.stringify({
+        type: "command.error",
+        request_id: request.id,
+        error: "backend_down",
+      }) });
+    });
+
+    expect(screen.queryByRole("heading", { name: "Backend недоступен" })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain("Backend недоступен");
+  });
+
+  it.fails("hides unsafe campaign-level switch-channel controls", async () => {
+    render(<App />);
+    login();
+
+    expect(screen.queryByRole("button", { name: /Сменить канал/i })).toBeNull();
+    expect(screen.getByText(/Смена канала для всей кампании отключена/i)).toBeTruthy();
   });
 
   it("replaces the optimistic campaign with the started backend campaign", async () => {

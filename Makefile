@@ -1,6 +1,6 @@
 GOCACHE ?= $(CURDIR)/.cache/go-build
 
-.PHONY: test lint smoke go-test status-test frontend-test compose-test
+.PHONY: test lint smoke go-test status-test frontend-test compose-test runtime-smoke
 
 test: go-test status-test compose-test
 
@@ -22,3 +22,6 @@ frontend-test:
 
 smoke:
 	./tests/smoke/health.sh
+
+runtime-smoke:
+	python3 tests/runtime/runtime_smoke.py

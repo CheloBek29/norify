@@ -46,16 +46,32 @@ func TestRollbackStatusAfterStartPublishFailure(t *testing.T) {
 }
 
 func TestCanStartCampaign(t *testing.T) {
-	if !canStartCampaign(campaigns.StatusCreated) {
-		t.Fatalf("created campaign should be startable")
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{campaigns.StatusCreated, true},
+		{campaigns.StatusStopped, true},
+		{campaigns.StatusRunning, false},
+		{campaigns.StatusRetrying, false},
+		{campaigns.StatusFinished, false},
+		{campaigns.StatusCancelled, false},
+		{"", false},
+		{"unknown", false},
 	}
-	if !canStartCampaign(campaigns.StatusStopped) {
-		t.Fatalf("stopped campaign should be resumable")
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := canStartCampaign(tt.status); got != tt.want {
+				t.Fatalf("canStartCampaign(%q) = %v, want %v", tt.status, got, tt.want)
+			}
+		})
 	}
-	if canStartCampaign(campaigns.StatusFinished) {
-		t.Fatalf("finished campaign must not be startable")
-	}
-	if canStartCampaign(campaigns.StatusCancelled) {
-		t.Fatalf("cancelled campaign must not be startable")
-	}
+}
+
+func TestRetryFailedCurrentMainKnownRisk(t *testing.T) {
+	t.Skip("known main gap: retryFailed still republish-dispatches a synthetic failed_count audience instead of atomically claiming real failed delivery rows")
+}
+
+func TestSwitchChannelCurrentMainKnownRisk(t *testing.T) {
+	t.Skip("known main gap: campaign-level switchChannel still mutates selected_channels and republishes synthetic dispatch; should be disabled or made row-based")
 }

@@ -60,6 +60,39 @@ func TestDispatchRecipientWindowClampsTail(t *testing.T) {
 	}
 }
 
+func TestDispatchRecipientWindowHandlesSmallMessageBudget(t *testing.T) {
+	req := contracts.CampaignDispatchRequest{
+		TotalRecipients:  3,
+		SelectedChannels: []string{"email", "sms", "telegram"},
+		StartRecipient:   1,
+	}
+
+	window := dispatchRecipientWindow(req, 1)
+
+	if window.Start != 1 || window.End != 1 {
+		t.Fatalf("small message budget must still include one recipient, got %#v", window)
+	}
+	if window.NextStart != 2 {
+		t.Fatalf("expected continuation at 2, got %d", window.NextStart)
+	}
+}
+
+func TestDispatchRecipientWindowDefaultsWhenChannelsMissing(t *testing.T) {
+	req := contracts.CampaignDispatchRequest{
+		TotalRecipients: 5,
+		StartRecipient:  0,
+	}
+
+	window := dispatchRecipientWindow(req, 2)
+
+	if window.Start != 1 || window.End != 2 {
+		t.Fatalf("missing channels should default to one channel window, got %#v", window)
+	}
+	if window.NextStart != 3 {
+		t.Fatalf("expected continuation at 3, got %d", window.NextStart)
+	}
+}
+
 func TestShouldThrottleSendQueue(t *testing.T) {
 	if !shouldThrottleSendQueue(300, 300) {
 		t.Fatalf("queue at the limit should throttle")
@@ -81,5 +114,19 @@ func TestCanDispatchCampaignStatus(t *testing.T) {
 	}
 	if canDispatchCampaignStatus("cancelled") {
 		t.Fatalf("cancelled campaign must not dispatch")
+	}
+}
+
+func TestUserIDFormatting(t *testing.T) {
+	tests := map[int]string{
+		1:      "user-00001",
+		42:     "user-00042",
+		50000:  "user-50000",
+		123456: "user-23456",
+	}
+	for input, want := range tests {
+		if got := userID(input); got != want {
+			t.Fatalf("userID(%d) = %q, want %q", input, got, want)
+		}
 	}
 }

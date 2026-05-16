@@ -35,12 +35,12 @@ Frontend is available at http://localhost:3000. It includes login, campaign crea
 
 ## PostgreSQL Viewer
 
-After `docker compose up --build`, open Adminer at http://localhost:8089 and sign in with:
+After `docker compose up --build`, open pgweb at http://localhost:8089.
 
-- `System`: `PostgreSQL`
-- `Server`: `postgres`
-- `Username`: `norify`
-- `Password`: `norify`
-- `Database`: `norify`
+Compose starts pgweb with this connection string:
+
+```text
+postgres://norify:norify@postgres:5432/norify?sslmode=disable
+```
 
 For desktop database clients use `localhost:5432` with the same username, password, and database.
