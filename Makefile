@@ -9,8 +9,9 @@ K8S_FORWARD_PID ?= $(CURDIR)/.cache/k8s-frontend.port-forward.pid
 K8S_FORWARD_PORT ?= $(CURDIR)/.cache/k8s-frontend.port-forward.port
 K8S_FORWARD_LOG ?= $(CURDIR)/.cache/k8s-frontend.port-forward.log
 REPLICAS ?= 2
+KEDA_VERSION ?= 2.19.0
 
-.PHONY: test lint smoke go-test ops-test status-test frontend-test compose-test demo-up demo-down demo-ps demo-logs demo-metrics k8s-build k8s-up k8s-down k8s-apply k8s-migrate k8s-metrics k8s-wait k8s-smoke k8s-forward k8s-forward-stop k8s-stop-service k8s-start-service k8s-status k8s-url
+.PHONY: test lint smoke go-test ops-test status-test frontend-test compose-test demo-up demo-down demo-ps demo-logs demo-metrics k8s-build k8s-up k8s-down k8s-apply k8s-keda-install k8s-keda-apply k8s-keda-status k8s-migrate k8s-metrics k8s-wait k8s-smoke k8s-forward k8s-forward-stop k8s-stop-service k8s-start-service k8s-status k8s-url
 
 test: go-test ops-test compose-test
 
@@ -66,6 +67,19 @@ k8s-apply:
 	$(KUBECTL) apply -f deploy/k8s/config.yaml
 	$(KUBECTL) apply -f deploy/k8s/stateful.yaml
 	$(KUBECTL) apply -f deploy/k8s/services.yaml
+
+k8s-keda-install:
+	$(KUBECTL) apply --server-side -f https://github.com/kedacore/keda/releases/download/v$(KEDA_VERSION)/keda-$(KEDA_VERSION).yaml
+	$(KUBECTL) rollout status deployment/keda-operator -n keda --timeout=180s
+	$(KUBECTL) rollout status deployment/keda-metrics-apiserver -n keda --timeout=180s
+
+k8s-keda-apply:
+	$(KUBECTL) apply -f deploy/keda
+	$(KUBECTL) -n $(K8S_NAMESPACE) get scaledobject sender-worker
+
+k8s-keda-status:
+	$(KUBECTL) get pods -n keda
+	$(KUBECTL) -n $(K8S_NAMESPACE) get scaledobject,hpa
 
 k8s-migrate:
 	$(KUBECTL) -n $(K8S_NAMESPACE) rollout status deployment/postgres --timeout=180s

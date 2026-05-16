@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/norify/platform/packages/contracts"
 	"github.com/norify/platform/packages/go-common/campaigns"
@@ -84,6 +85,7 @@ func main() {
 		appruntime.LogStartup("campaign-service schema", ensureSchema(ctx))
 	}
 	startCampaignPublisher(ctx)
+	startDispatchRecovery(ctx)
 
 	mux := httpapi.NewMux(httpapi.Service{Name: "campaign-service", Version: "0.2.0", Ready: func() bool { return db != nil && publisherAvailable() }})
 	mux.HandleFunc("/campaigns", campaignsCollection)
@@ -270,6 +272,10 @@ func campaignAction(w http.ResponseWriter, r *http.Request) {
 		handleErrorGroupAction(w, r, id, parts[2], parts[3])
 		return
 	}
+	if len(parts) == 3 && parts[1] == "dispatch" {
+		handleDispatchStateAction(w, r, id, parts[2])
+		return
+	}
 	if len(parts) != 2 {
 		httpapi.WriteJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 		return
@@ -331,6 +337,59 @@ func dispatchMetrics(w http.ResponseWriter, r *http.Request, id string) {
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
 }
 
+func handleDispatchStateAction(w http.ResponseWriter, r *http.Request, id, action string) {
+	if r.Method != http.MethodPost {
+		httpapi.WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	switch action {
+	case "claim":
+		claimDispatch(w, r, id)
+	case "complete":
+		completeDispatch(w, r, id)
+	default:
+		httpapi.WriteJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_dispatch_action"})
+	}
+}
+
+func claimDispatch(w http.ResponseWriter, r *http.Request, id string) {
+	claim, ok, err := claimDispatchWindow(r.Context(), id, time.Now().UTC())
+	if err != nil {
+		writeLookupError(w, err)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, claim)
+}
+
+func completeDispatch(w http.ResponseWriter, r *http.Request, id string) {
+	var req contracts.CampaignDispatchComplete
+	if err := httpapi.ReadJSON(r, &req); err != nil {
+		httpapi.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	if req.CampaignID == "" {
+		req.CampaignID = id
+	}
+	if req.CampaignID != id || req.LeaseStart <= 0 || req.LeaseEnd < req.LeaseStart {
+		httpapi.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_dispatch_completion"})
+		return
+	}
+	hasMore, err := completeDispatchWindow(r.Context(), req)
+	if err != nil {
+		httpapi.WriteJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	campaign, err := getCampaign(r.Context(), id)
+	if err == nil {
+		_ = publishCampaignProgress(r.Context(), campaign)
+	}
+	httpapi.WriteJSON(w, http.StatusOK, map[string]any{"has_more": hasMore})
+}
+
 func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
 	now := time.Now().UTC()
 	campaign, rollback, started, err := transitionCampaignToRunning(r.Context(), id, now)
@@ -340,6 +399,11 @@ func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if !started {
 		httpapi.WriteJSON(w, http.StatusConflict, map[string]string{"error": "campaign_not_startable"})
+		return
+	}
+	if err := upsertDispatchState(r.Context(), id); err != nil {
+		_, _ = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = $3, updated_at = now() WHERE id = $1 AND status = $4`, id, rollback.Status, rollback.StartedAt, campaigns.StatusRunning)
+		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	if err := publishDispatch(r.Context(), campaign); err != nil {
@@ -413,6 +477,251 @@ func transitionCampaignToRunning(ctx context.Context, id string, startedAt time.
 type rollbackStartState struct {
 	Status    string
 	StartedAt *time.Time
+}
+
+type recipientWindow struct {
+	Start     int
+	End       int
+	NextStart int
+}
+
+func dispatchRecipientWindow(req contracts.CampaignDispatchRequest, maxMessages int) recipientWindow {
+	start := req.StartRecipient
+	if start <= 0 {
+		start = 1
+	}
+	totalRecipients := req.TotalRecipients
+	if len(req.SpecificRecipients) > 0 {
+		totalRecipients = len(req.SpecificRecipients)
+	}
+	channelsCount := len(req.SelectedChannels)
+	for _, recipient := range req.SpecificRecipients {
+		if len(recipient.Channels) > channelsCount {
+			channelsCount = len(recipient.Channels)
+		}
+	}
+	if channelsCount <= 0 {
+		channelsCount = 1
+	}
+	if maxMessages <= 0 {
+		maxMessages = 90
+	}
+	recipients := maxMessages / channelsCount
+	if recipients <= 0 {
+		recipients = 1
+	}
+	end := start + recipients - 1
+	if end > totalRecipients {
+		end = totalRecipients
+	}
+	nextStart := 0
+	if end < totalRecipients {
+		nextStart = end + 1
+	}
+	return recipientWindow{Start: start, End: end, NextStart: nextStart}
+}
+
+func upsertDispatchState(ctx context.Context, campaignID string) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO campaign_dispatch_state (campaign_id, next_recipient, completed_at, updated_at)
+		VALUES ($1, 1, NULL, now())
+		ON CONFLICT (campaign_id) DO UPDATE
+		SET completed_at = NULL,
+		    lease_start = NULL,
+		    lease_end = NULL,
+		    lease_until = NULL,
+		    updated_at = now()
+		WHERE campaign_dispatch_state.completed_at IS NOT NULL`, campaignID)
+	return err
+}
+
+func dispatchLeaseDuration() time.Duration {
+	seconds := appruntime.EnvInt("DISPATCH_LEASE_SECONDS", 30)
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func dispatchRecoveryCooldownSeconds() int {
+	seconds := appruntime.EnvInt("DISPATCH_RECOVERY_STALE_SECONDS", 30)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+func dispatchSendPriority(processed int) uint8 {
+	if processed <= 0 {
+		return 9
+	}
+	return 5
+}
+
+func claimDispatchWindow(ctx context.Context, campaignID string, now time.Time) (contracts.CampaignDispatchClaim, bool, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO campaign_dispatch_state (campaign_id, next_recipient)
+		SELECT id, 1 FROM campaigns WHERE id = $1
+		ON CONFLICT (campaign_id) DO NOTHING`, campaignID); err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+
+	row := tx.QueryRow(ctx, `
+		SELECT c.id, c.template_id, COALESCE(t.body, ''), c.status, c.archived_at, c.total_recipients,
+		       c.sent_count, c.failed_count, c.cancelled_count,
+		       c.selected_channels, c.specific_recipients, ds.next_recipient,
+		       ds.lease_until, ds.completed_at
+		FROM campaigns c
+		LEFT JOIN templates t ON t.id = c.template_id
+		JOIN campaign_dispatch_state ds ON ds.campaign_id = c.id
+		WHERE c.id = $1
+		FOR UPDATE OF ds`, campaignID)
+
+	var claim contracts.CampaignDispatchClaim
+	var status string
+	var archivedAt pgtype.Timestamptz
+	var sentCount, failedCount, cancelledCount int
+	var selected, specific []byte
+	var nextRecipient int
+	var leaseUntil, completedAt pgtype.Timestamptz
+	if err := row.Scan(&claim.CampaignID, &claim.TemplateID, &claim.MessageBody, &status, &archivedAt, &claim.TotalRecipients, &sentCount, &failedCount, &cancelledCount, &selected, &specific, &nextRecipient, &leaseUntil, &completedAt); err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	if archivedAt.Valid || (status != campaigns.StatusRunning && status != campaigns.StatusRetrying) {
+		if err := tx.Commit(ctx); err != nil {
+			return contracts.CampaignDispatchClaim{}, false, err
+		}
+		return contracts.CampaignDispatchClaim{}, false, nil
+	}
+	if completedAt.Valid || (leaseUntil.Valid && leaseUntil.Time.After(now)) {
+		if err := tx.Commit(ctx); err != nil {
+			return contracts.CampaignDispatchClaim{}, false, err
+		}
+		return contracts.CampaignDispatchClaim{}, false, nil
+	}
+	_ = json.Unmarshal(selected, &claim.SelectedChannels)
+	_ = json.Unmarshal(specific, &claim.SpecificRecipients)
+	if len(claim.SpecificRecipients) > 0 {
+		claim.TotalRecipients = len(claim.SpecificRecipients)
+	}
+	if nextRecipient <= 0 {
+		nextRecipient = 1
+	}
+	if claim.TotalRecipients <= 0 || nextRecipient > claim.TotalRecipients {
+		if _, err := tx.Exec(ctx, `
+			UPDATE campaign_dispatch_state
+			SET completed_at = COALESCE(completed_at, $2),
+			    lease_start = NULL,
+			    lease_end = NULL,
+			    lease_until = NULL,
+			    updated_at = now()
+			WHERE campaign_id = $1`, campaignID, now); err != nil {
+			return contracts.CampaignDispatchClaim{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return contracts.CampaignDispatchClaim{}, false, err
+		}
+		return contracts.CampaignDispatchClaim{}, false, nil
+	}
+
+	window := dispatchClaimWindow(claim.TotalRecipients, claim.SelectedChannels, claim.SpecificRecipients, nextRecipient, appruntime.EnvInt("DISPATCH_MAX_MESSAGES_PER_TICK", 90))
+	claim.BatchSize = appruntime.EnvInt("DISPATCH_BATCH_SIZE", campaigns.DefaultDispatchBatchSize)
+	claim.LeaseStart = window.Start
+	claim.LeaseEnd = window.End
+	claim.HasMore = window.NextStart > 0
+	claim.LeaseUntil = now.Add(dispatchLeaseDuration())
+	claim.SendPriority = dispatchSendPriority(sentCount + failedCount + cancelledCount)
+	if _, err := tx.Exec(ctx, `
+		UPDATE campaign_dispatch_state
+		SET lease_start = $2,
+		    lease_end = $3,
+		    lease_until = $4,
+		    completed_at = NULL,
+		    updated_at = now()
+		WHERE campaign_id = $1`, campaignID, claim.LeaseStart, claim.LeaseEnd, claim.LeaseUntil); err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	return claim, true, nil
+}
+
+func completeDispatchWindow(ctx context.Context, req contracts.CampaignDispatchComplete) (bool, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	row := tx.QueryRow(ctx, `
+		SELECT c.total_recipients, c.specific_recipients, ds.lease_start, ds.lease_end
+		FROM campaigns c
+		JOIN campaign_dispatch_state ds ON ds.campaign_id = c.id
+		WHERE c.id = $1
+		FOR UPDATE OF ds`, req.CampaignID)
+	var totalRecipients int
+	var leaseStart, leaseEnd pgtype.Int4
+	var specific []byte
+	if err := row.Scan(&totalRecipients, &specific, &leaseStart, &leaseEnd); err != nil {
+		return false, err
+	}
+	var recipients []contracts.CampaignRecipient
+	_ = json.Unmarshal(specific, &recipients)
+	if len(recipients) > 0 {
+		totalRecipients = len(recipients)
+	}
+	if !leaseStart.Valid || !leaseEnd.Valid || int(leaseStart.Int32) != req.LeaseStart || int(leaseEnd.Int32) != req.LeaseEnd {
+		return false, errors.New("dispatch_lease_mismatch")
+	}
+	nextRecipient := req.LeaseEnd + 1
+	completed := nextRecipient > totalRecipients
+	var completedAt any
+	if completed {
+		completedAt = req.ReportedAt
+		if req.ReportedAt.IsZero() {
+			completedAt = time.Now().UTC()
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE campaign_dispatch_state
+		SET next_recipient = $2,
+		    lease_start = NULL,
+		    lease_end = NULL,
+		    lease_until = NULL,
+		    completed_at = $3,
+		    updated_at = now()
+		WHERE campaign_id = $1`, req.CampaignID, nextRecipient, completedAt); err != nil {
+		return false, err
+	}
+	if req.P95DispatchMs > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE campaigns
+			SET p95_dispatch_ms = GREATEST(p95_dispatch_ms, $2), updated_at = now()
+			WHERE id = $1`, req.CampaignID, req.P95DispatchMs); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return !completed, nil
+}
+
+func dispatchClaimWindow(totalRecipients int, selectedChannels []string, specificRecipients []contracts.CampaignRecipient, start, maxMessages int) recipientWindow {
+	req := contracts.CampaignDispatchRequest{
+		TotalRecipients:    totalRecipients,
+		SelectedChannels:   selectedChannels,
+		SpecificRecipients: specificRecipients,
+		StartRecipient:     start,
+	}
+	return dispatchRecipientWindow(req, maxMessages)
 }
 
 func canStartCampaign(status string) bool {
@@ -985,6 +1294,80 @@ func publishCampaignProgress(ctx context.Context, campaign Campaign) error {
 	return publishJSON(ctx, "publish-campaign-progress", appruntime.ExchangeCampaignStatus, "campaign.progress", event)
 }
 
+func startDispatchRecovery(ctx context.Context) {
+	go func() {
+		interval := time.Duration(appruntime.EnvInt("DISPATCH_RECOVERY_INTERVAL_SECONDS", 5)) * time.Second
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if db != nil && publisherAvailable() {
+					if count, err := recoverDispatchWakeups(ctx); err != nil {
+						slog.Warn("recover dispatch wakeups", "error", err)
+					} else if count > 0 {
+						slog.Info("recovered dispatch wakeups", "count", count)
+					}
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+}
+
+func recoverDispatchWakeups(ctx context.Context) (int, error) {
+	if _, err := db.Exec(ctx, `
+		INSERT INTO campaign_dispatch_state (campaign_id, next_recipient)
+		SELECT c.id, 1
+		FROM campaigns c
+		WHERE c.status IN ($1, $2)
+		  AND c.archived_at IS NULL
+		ON CONFLICT (campaign_id) DO NOTHING`, campaigns.StatusRunning, campaigns.StatusRetrying); err != nil {
+		return 0, err
+	}
+
+	rows, err := db.Query(ctx, `
+		SELECT c.id
+		FROM campaigns c
+		JOIN campaign_dispatch_state ds ON ds.campaign_id = c.id
+		WHERE c.status IN ($1, $2)
+		  AND c.archived_at IS NULL
+		  AND ds.completed_at IS NULL
+		  AND (ds.lease_until IS NULL OR ds.lease_until < now())
+		  AND ds.updated_at < now() - make_interval(secs => $4::int)
+		ORDER BY ds.updated_at ASC, c.created_at ASC
+		LIMIT $3`, campaigns.StatusRunning, campaigns.StatusRetrying, appruntime.EnvInt("DISPATCH_RECOVERY_WAKEUPS", 100), dispatchRecoveryCooldownSeconds())
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var campaignID string
+		if err := rows.Scan(&campaignID); err != nil {
+			return count, err
+		}
+		if err := publishDispatchWakeup(ctx, campaignID); err != nil {
+			return count, err
+		}
+		if _, err := db.Exec(ctx, `
+			UPDATE campaign_dispatch_state
+			SET updated_at = now()
+			WHERE campaign_id = $1
+			  AND completed_at IS NULL
+			  AND (lease_until IS NULL OR lease_until < now())`, campaignID); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, rows.Err()
+}
+
 func campaignTotalMessages(ctx context.Context, campaignID string) int {
 	var total int
 	_ = db.QueryRow(ctx, `SELECT total_messages FROM campaigns WHERE id = $1`, campaignID).Scan(&total)
@@ -992,9 +1375,17 @@ func campaignTotalMessages(ctx context.Context, campaignID string) int {
 }
 
 func publishDispatch(ctx context.Context, campaign Campaign) error {
+	return publishDispatchWakeup(ctx, campaign.ID)
+}
+
+func publishDispatchWakeup(ctx context.Context, campaignID string) error {
+	return publishJSON(ctx, "publish-campaign-dispatch", "", appruntime.QueueCampaignDispatch, contracts.CampaignDispatchWakeup{CampaignID: campaignID})
+}
+
+func legacyDispatchRequest(ctx context.Context, campaign Campaign) contracts.CampaignDispatchRequest {
 	body := ""
 	_ = db.QueryRow(ctx, `SELECT body FROM templates WHERE id = $1`, campaign.TemplateID).Scan(&body)
-	req := contracts.CampaignDispatchRequest{
+	return contracts.CampaignDispatchRequest{
 		CampaignID:         campaign.ID,
 		TemplateID:         campaign.TemplateID,
 		MessageBody:        body,
@@ -1004,7 +1395,6 @@ func publishDispatch(ctx context.Context, campaign Campaign) error {
 		BatchSize:          appruntime.EnvInt("DISPATCH_BATCH_SIZE", campaigns.DefaultDispatchBatchSize),
 		RequestedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
-	return publishJSON(ctx, "publish-campaign-dispatch", "", appruntime.QueueCampaignDispatch, req)
 }
 
 func getCampaign(ctx context.Context, id string) (Campaign, error) {
@@ -1053,7 +1443,25 @@ func ensureSchema(ctx context.Context) error {
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS specific_recipients jsonb NOT NULL DEFAULT '[]';
 		CREATE INDEX IF NOT EXISTS idx_campaigns_active_created_at ON campaigns(created_at DESC) WHERE archived_at IS NULL;
-		ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_template_id_fkey;`)
+		ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_template_id_fkey;
+		CREATE TABLE IF NOT EXISTS campaign_dispatch_state (
+		  campaign_id text PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE,
+		  next_recipient int NOT NULL DEFAULT 1,
+		  lease_start int,
+		  lease_end int,
+		  lease_until timestamptz,
+		  completed_at timestamptz,
+		  created_at timestamptz NOT NULL DEFAULT now(),
+		  updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS idx_campaign_dispatch_state_recoverable
+		  ON campaign_dispatch_state (completed_at, lease_until, updated_at);
+		INSERT INTO campaign_dispatch_state (campaign_id, next_recipient, completed_at)
+		SELECT c.id, 1,
+		       CASE WHEN c.status IN ('finished', 'cancelled') THEN COALESCE(c.finished_at, now()) ELSE NULL END
+		FROM campaigns c
+		WHERE c.status IN ('running', 'retrying', 'stopped', 'created', 'finished', 'cancelled')
+		ON CONFLICT (campaign_id) DO NOTHING;`)
 	return err
 }
 

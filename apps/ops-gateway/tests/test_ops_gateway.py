@@ -6,12 +6,14 @@ import pytest
 from main import (
     ProgressSnapshot,
     app,
+    apply_campaign_event,
     apply_message_event,
     campaign_totals,
     connections,
     handle_ops_command,
     message_states,
     ops_connections,
+    read_keda_worker_scaling_policy,
     snapshots,
 )
 
@@ -165,37 +167,84 @@ async def test_ops_overview_aggregates_health_workers_and_realtime_state(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_message_events_are_counted_by_idempotency_key():
+async def test_message_events_do_not_mutate_authoritative_campaign_snapshot():
     snapshots.clear()
     campaign_totals.clear()
     message_states.clear()
 
+    await apply_campaign_event({
+        "campaign_id": "campaign-retry",
+        "status": "running",
+        "total_messages": 10,
+        "processed": 4,
+        "success": 3,
+        "failed": 1,
+        "cancelled": 0,
+        "progress_percent": 40,
+    })
+
     base = {
         "campaign_id": "campaign-retry",
-        "total_messages": 2,
+        "total_messages": 10,
         "user_id": "user-1",
         "channel_code": "telegram",
         "idempotency_key": "campaign-retry:user-1:telegram",
     }
 
     await apply_message_event({**base, "status": "failed", "attempt": 1})
-    await apply_message_event({**base, "status": "failed", "attempt": 2})
-    assert snapshots["campaign-retry"].failed == 1
-    assert snapshots["campaign-retry"].processed == 1
+    await apply_message_event({**base, "status": "sent", "attempt": 2})
 
-    await apply_message_event({**base, "status": "sent", "attempt": 3})
-    assert snapshots["campaign-retry"].success == 1
+    assert message_states["campaign-retry"]["campaign-retry:user-1:telegram"] == "sent"
+    assert snapshots["campaign-retry"].success == 3
+    assert snapshots["campaign-retry"].failed == 1
+    assert snapshots["campaign-retry"].processed == 4
+
+    await apply_campaign_event({
+        "campaign_id": "campaign-retry",
+        "status": "running",
+        "total_messages": 10,
+        "processed": 5,
+        "success": 4,
+        "failed": 1,
+        "cancelled": 0,
+        "progress_percent": 50,
+    })
+
+    assert snapshots["campaign-retry"].success == 4
+    assert snapshots["campaign-retry"].processed == 5
+
+    await apply_campaign_event({
+        "campaign_id": "campaign-retry",
+        "status": "running",
+        "total_messages": 10,
+        "processed": 5,
+        "success": 5,
+        "failed": 0,
+        "cancelled": 0,
+        "progress_percent": 50,
+    })
+
     assert snapshots["campaign-retry"].failed == 0
-    assert snapshots["campaign-retry"].processed == 1
 
 
 @pytest.mark.asyncio
-async def test_message_events_persist_snapshot_to_redis(monkeypatch):
+async def test_message_events_do_not_overwrite_cached_progress_snapshot(monkeypatch):
     snapshots.clear()
     campaign_totals.clear()
     message_states.clear()
     store = {}
     enable_fake_redis(monkeypatch, store)
+
+    await apply_campaign_event({
+        "campaign_id": "campaign-cache",
+        "status": "running",
+        "total_messages": 5,
+        "processed": 2,
+        "success": 2,
+        "failed": 0,
+        "cancelled": 0,
+        "progress_percent": 40,
+    })
 
     await apply_message_event({
         "campaign_id": "campaign-cache",
@@ -208,7 +257,8 @@ async def test_message_events_persist_snapshot_to_redis(monkeypatch):
 
     cached = json.loads(store["campaign-snapshot:campaign-cache"])
     assert cached["campaign_id"] == "campaign-cache"
-    assert cached["processed"] == 1
+    assert cached["processed"] == 2
+    assert cached["success"] == 2
 
 
 @pytest.mark.asyncio
@@ -379,6 +429,132 @@ async def test_worker_bounds_update_sets_min_and_max(monkeypatch):
 
     invalid = client.post("/workers/bounds", json={"min_replicas": 7, "max_replicas": 6})
     assert invalid.status_code == 400
+
+
+def test_keda_worker_policy_reads_scaled_object_and_deployment(monkeypatch):
+    def fake_scaled_object(method, payload=None):
+        assert method == "GET"
+        assert payload is None
+        return {"spec": {"minReplicaCount": 3, "maxReplicaCount": 20}}
+
+    def fake_deployment(method, payload=None):
+        assert method == "GET"
+        assert payload is None
+        return {"spec": {"replicas": 8}, "status": {"readyReplicas": 7}}
+
+    monkeypatch.setattr("main.kubernetes_scaled_object_request", fake_scaled_object)
+    monkeypatch.setattr("main.kubernetes_deployment_request", fake_deployment)
+
+    policy = read_keda_worker_scaling_policy()
+
+    assert policy == {"replicas": 7, "desired_replicas": 8, "min_replicas": 3, "max_replicas": 20}
+
+
+def test_keda_worker_policy_falls_back_to_dns_when_scaled_object_is_missing(monkeypatch):
+    monkeypatch.setenv("WORKER_CONTROL_MODE", "keda")
+    monkeypatch.setattr("main.kubernetes_scaled_object_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("404")))
+    monkeypatch.setattr("main.socket.getaddrinfo", lambda *_args, **_kwargs: [
+        (None, None, None, "", ("172.20.0.2", 0)),
+        (None, None, None, "", ("172.20.0.3", 0)),
+    ])
+
+    import asyncio
+
+    policy = asyncio.run(__import__("main").read_worker_scaling_policy())
+
+    assert policy == {"replicas": 2, "desired_replicas": 2, "min_replicas": 2, "max_replicas": 2}
+
+
+def test_keda_worker_bounds_fall_back_to_deployment_when_scaled_object_is_missing(monkeypatch):
+    store = {}
+    patches = []
+    enable_fake_redis(monkeypatch, store)
+    monkeypatch.setenv("WORKER_CONTROL_MODE", "keda")
+    monkeypatch.setattr("main.kubernetes_scaled_object_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("404")))
+
+    def fake_deployment(method, payload=None):
+        if method == "PATCH":
+            patches.append(payload)
+            return {"spec": {"replicas": payload["spec"]["replicas"]}, "status": {"readyReplicas": payload["spec"]["replicas"]}}
+        return {"spec": {"replicas": 3}, "status": {"readyReplicas": 3}}
+
+    async def fake_proxy(_method, _url, payload=None):
+        return {"active_workers": 1, "min_workers": 1, "max_workers": 1, "queue_depth": 0}
+
+    monkeypatch.setattr("main.kubernetes_deployment_request", fake_deployment)
+    monkeypatch.setattr("main.proxy_json", fake_proxy)
+
+    client = TestClient(app)
+    response = client.post("/workers/bounds", json={"min_replicas": 1, "max_replicas": 5})
+
+    assert response.status_code == 200
+    assert response.json()["replicas"] == 3
+    assert response.json()["desired_replicas"] == 3
+    assert response.json()["min_replicas"] == 1
+    assert response.json()["max_replicas"] == 5
+    assert patches == []
+    assert json.loads(store["worker-scaling-policy:sender-worker"])["max_replicas"] == 5
+
+
+def test_keda_worker_bounds_fallback_clamps_deployment_replicas(monkeypatch):
+    store = {}
+    patches = []
+    enable_fake_redis(monkeypatch, store)
+    monkeypatch.setenv("WORKER_CONTROL_MODE", "keda")
+    monkeypatch.setattr("main.kubernetes_scaled_object_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("404")))
+
+    def fake_deployment(method, payload=None):
+        if method == "PATCH":
+            patches.append(payload)
+            return {"spec": {"replicas": payload["spec"]["replicas"]}, "status": {"readyReplicas": payload["spec"]["replicas"]}}
+        return {"spec": {"replicas": 3}, "status": {"readyReplicas": 3}}
+
+    async def fake_proxy(_method, _url, payload=None):
+        return {"active_workers": 1, "min_workers": 1, "max_workers": 1, "queue_depth": 0}
+
+    monkeypatch.setattr("main.kubernetes_deployment_request", fake_deployment)
+    monkeypatch.setattr("main.proxy_json", fake_proxy)
+
+    client = TestClient(app)
+    response = client.post("/workers/bounds", json={"min_replicas": 4, "max_replicas": 8})
+
+    assert response.status_code == 200
+    assert response.json()["desired_replicas"] == 4
+    assert patches == [{"spec": {"replicas": 4}}]
+
+
+@pytest.mark.asyncio
+async def test_rabbitmq_status_topology_declares_exchanges_before_binding():
+    class FakeQueue:
+        def __init__(self, name):
+            self.name = name
+            self.binds = []
+
+        async def bind(self, exchange, routing_key):
+            self.binds.append((exchange["name"], routing_key))
+
+    class FakeChannel:
+        def __init__(self):
+            self.exchanges = []
+            self.queues = {}
+
+        async def declare_exchange(self, name, **kwargs):
+            self.exchanges.append((name, kwargs))
+            return {"name": name}
+
+        async def declare_queue(self, name, **_kwargs):
+            queue = FakeQueue(name)
+            self.queues[name] = queue
+            return queue
+
+    channel = FakeChannel()
+    message_queue, campaign_queue, result_queue, error_queue = await __import__("main").declare_status_topology(channel)
+
+    assert [name for name, _ in channel.exchanges] == ["message.status.events", "campaign.status.events"]
+    assert message_queue.binds == [("message.status.events", "#")]
+    assert campaign_queue.binds == [("campaign.status.events", "#")]
+    assert result_queue.name == "message.send.result"
+    assert error_queue.name == "message.send.error"
 
 
 @pytest.mark.asyncio

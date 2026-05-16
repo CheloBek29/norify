@@ -28,6 +28,35 @@ type CampaignDispatchRequest struct {
 	RequestedAt        string              `json:"requested_at"`
 }
 
+type CampaignDispatchWakeup struct {
+	CampaignID string `json:"campaign_id"`
+}
+
+type CampaignDispatchClaim struct {
+	CampaignID         string              `json:"campaign_id"`
+	TemplateID         string              `json:"template_id"`
+	MessageBody        string              `json:"message_body"`
+	TotalRecipients    int                 `json:"total_recipients"`
+	SelectedChannels   []string            `json:"selected_channels"`
+	SpecificRecipients []CampaignRecipient `json:"specific_recipients,omitempty"`
+	BatchSize          int                 `json:"batch_size"`
+	LeaseStart         int                 `json:"lease_start"`
+	LeaseEnd           int                 `json:"lease_end"`
+	HasMore            bool                `json:"has_more"`
+	LeaseUntil         time.Time           `json:"lease_until"`
+	SendPriority       uint8               `json:"send_priority,omitempty"`
+}
+
+type CampaignDispatchComplete struct {
+	CampaignID    string    `json:"campaign_id"`
+	LeaseStart    int       `json:"lease_start"`
+	LeaseEnd      int       `json:"lease_end"`
+	BatchCount    int       `json:"batch_count"`
+	DurationMs    int       `json:"duration_ms"`
+	P95DispatchMs int       `json:"p95_dispatch_ms"`
+	ReportedAt    time.Time `json:"reported_at"`
+}
+
 type CampaignRecipient struct {
 	UserID   string   `json:"user_id"`
 	Channels []string `json:"channels"`

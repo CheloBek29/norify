@@ -17,8 +17,26 @@ spec:
             - {name: POSTGRES_DB, value: norify}
             - {name: POSTGRES_USER, value: norify}
             - {name: POSTGRES_PASSWORD, value: norify}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          volumeMounts:
+            - {name: postgres-data, mountPath: /var/lib/postgresql/data}
           readinessProbe:
             exec: {command: ["pg_isready", "-U", "norify", "-d", "norify"]}
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: norify
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
 ---
 apiVersion: v1
 kind: Service
@@ -63,7 +81,19 @@ spec:
             failureThreshold: 12
       volumes:
         - name: rabbitmq-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: rabbitmq-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-data
+  namespace: norify
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service

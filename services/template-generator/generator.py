@@ -1,7 +1,6 @@
 import logging
+import ssl
 from typing import Optional
-
-import aiohttp
 
 from config import settings
 from prompts import PROMPT_NEWSLETTER_TEMPLATE, STYLES, SYSTEM_PROMPT_BASE
@@ -11,9 +10,17 @@ logger = logging.getLogger(__name__)
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
+def mistral_ssl_context() -> ssl.SSLContext:
+    import certifi
+
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 async def _call_mistral(system: str, user: str) -> str:
     if not settings.MISTRAL_API_KEY:
         return "Error: MISTRAL_API_KEY not set"
+    import aiohttp
+
     headers = {
         "Authorization": f"Bearer {settings.MISTRAL_API_KEY}",
         "Content-Type": "application/json",
@@ -28,15 +35,36 @@ async def _call_mistral(system: str, user: str) -> str:
         "max_tokens": 1500,
     }
     try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        timeout = aiohttp.ClientTimeout(total=settings.GENERATION_TIMEOUT)
+        connector = aiohttp.TCPConnector(ssl=mistral_ssl_context())
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data["choices"][0]["message"]["content"]
+                    return extract_mistral_content(data)
                 error = await resp.text()
                 return f"Error {resp.status}: {error[:200]}"
     except Exception as e:
         return f"Error: {e}"
+
+
+def extract_mistral_content(data: dict) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Mistral response does not contain generated text") from exc
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if parts:
+            return "".join(parts)
+
+    raise ValueError("Mistral response content has unsupported format")
 
 
 class TemplateGenerator:

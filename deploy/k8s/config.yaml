@@ -5,7 +5,7 @@ metadata:
   namespace: norify
 data:
   POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
-  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq.norify.svc.cluster.local:5672/
   REDIS_URL: redis://redis:6379/0
   AUTH_SERVICE_URL: http://auth-service:8080
   USER_SERVICE_URL: http://user-service:8080
@@ -15,10 +15,13 @@ data:
   DISPATCHER_SERVICE_URL: http://dispatcher-service:8080
   SENDER_SERVICE_URL: http://sender-worker:8080
   STATS_SERVICE_URL: http://stats-service:8080
-  WORKER_CONTROL_MODE: kubernetes
+  DISPATCHER_WORKERS: "4"
+  DISPATCH_MAX_SEND_QUEUE_DEPTH: "10000"
+  DISPATCH_RECOVERY_STALE_SECONDS: "30"
+  WORKER_CONTROL_MODE: keda
   WORKER_CONTROL_MAX_REPLICAS: "20"
   WORKER_K8S_DEPLOYMENT: sender-worker
-  WORKER_K8S_HPA: sender-worker
+  WORKER_K8S_SCALED_OBJECT: sender-worker
   NOTIFICATION_ERROR_SERVICE_URL: http://notification-error-service:8080
   OPS_GATEWAY_URL: http://ops-gateway:8080
 ---

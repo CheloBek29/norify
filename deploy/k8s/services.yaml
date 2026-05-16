@@ -85,7 +85,7 @@ spec:
             - configMapRef: {name: norify-config}
             - secretRef: {name: norify-secret}
           env:
-            - {name: WORKER_PREFETCH, value: "1"}
+            - {name: WORKER_PREFETCH, value: "20"}
             - {name: WORKER_MIN_POOL, value: "1"}
             - {name: WORKER_MAX_POOL, value: "1"}
           resources:
@@ -95,35 +95,12 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          startupProbe:
+            httpGet: {path: /health/live, port: 8080}
+            periodSeconds: 2
+            failureThreshold: 45
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
           readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: sender-worker
-  namespace: norify
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: sender-worker
-  minReplicas: 3
-  maxReplicas: 20
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-  behavior:
-    scaleDown:
-      stabilizationWindowSeconds: 30
-      policies:
-        - type: Percent
-          value: 100
-          periodSeconds: 15
 ---
 apiVersion: v1
 kind: Service
@@ -148,6 +125,14 @@ metadata:
 rules:
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
+    resourceNames: ["sender-worker"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    resourceNames: ["sender-worker"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
     resourceNames: ["sender-worker"]
     verbs: ["get", "patch"]
 ---

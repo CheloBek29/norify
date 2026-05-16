@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,11 +27,16 @@ import (
 
 var db *pgxpool.Pool
 
-// pubCh is a shared channel used only for publishing outbound events and retries.
-// It is managed by maintainPubChannel and accessed under pubMu.
+// pubOps is a shared publisher used by the HTTP handler.
+// It is managed by the reconnect loop and accessed under pubMu.
 var (
-	pubCh *amqp.Channel
-	pubMu sync.Mutex
+	pubOps *amqpChannelOps
+	pubMu  sync.Mutex
+)
+
+const (
+	freshSendPriority      uint8 = 5
+	automaticRetryPriority uint8 = 1
 )
 
 func main() {
@@ -41,14 +47,14 @@ func main() {
 	db, err = appruntime.OpenPostgres(ctx)
 	appruntime.LogStartup("sender-worker postgres", err)
 
-	// Keep a dedicated publishing channel alive for HTTP handler and process().
+	// Keep a dedicated publishing channel alive for the HTTP handler.
 	go appruntime.RunWithReconnect(ctx, "sender-worker-pub", func(ctx context.Context, ch *amqp.Channel) error {
 		pubMu.Lock()
-		pubCh = ch
+		pubOps = newAMQPChannelOps(ch)
 		pubMu.Unlock()
 		defer func() {
 			pubMu.Lock()
-			pubCh = nil
+			pubOps = nil
 			pubMu.Unlock()
 		}()
 		<-ctx.Done()
@@ -81,10 +87,22 @@ type workerPool struct {
 }
 
 func newWorkerPool() *workerPool {
+	minWorkers := appruntime.EnvInt("WORKER_MIN_POOL", 1)
+	maxWorkers := appruntime.EnvInt("WORKER_MAX_POOL", 20)
+	if minWorkers < 1 {
+		minWorkers = 1
+	}
+	if maxWorkers < minWorkers {
+		maxWorkers = minWorkers
+	}
+	if strings.EqualFold(appruntime.Env("WORKER_CONTROL_MODE", ""), "kubernetes") {
+		minWorkers = 1
+		maxWorkers = minWorkers
+	}
 	return &workerPool{
 		workers: make(map[int]context.CancelFunc),
-		min:     appruntime.EnvInt("WORKER_MIN_POOL", 1),
-		max:     appruntime.EnvInt("WORKER_MAX_POOL", 1),
+		min:     minWorkers,
+		max:     maxWorkers,
 	}
 }
 
@@ -116,11 +134,11 @@ func (p *workerPool) run(parentCtx context.Context) {
 
 func (p *workerPool) scale(parentCtx context.Context) {
 	depth := appruntime.QueueDepth(appruntime.QueueMessageSend)
-	target := p.targetSize(depth)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	target := p.targetSizeLocked(depth)
 	for len(p.workers) < target {
 		p.launch(parentCtx)
 	}
@@ -131,6 +149,12 @@ func (p *workerPool) scale(parentCtx context.Context) {
 
 // targetSize maps queue depth to desired worker count using linear interpolation.
 func (p *workerPool) targetSize(depth int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.targetSizeLocked(depth)
+}
+
+func (p *workerPool) targetSizeLocked(depth int) int {
 	if depth < 0 {
 		// Management API unreachable — keep current count, but no less than min.
 		if len(p.workers) > p.min {
@@ -207,7 +231,8 @@ func (p *workerPool) killOne() {
 // ---------------------------------------------------------------------------
 
 func consumeMessages(ctx context.Context, ch *amqp.Channel) error {
-	prefetch := appruntime.EnvInt("WORKER_PREFETCH", 20)
+	channelOps := newAMQPChannelOps(ch)
+	prefetch := workerPrefetch()
 	if err := ch.Qos(prefetch, 0, false); err != nil {
 		return fmt.Errorf("qos: %w", err)
 	}
@@ -246,25 +271,57 @@ func consumeMessages(ctx context.Context, ch *amqp.Channel) error {
 					results <- deliveryResult{delivery: d, err: err}
 					return
 				}
-				err := processWithChannel(ctx, ch, req)
+				err := processWithPublisher(ctx, channelOps, req)
 				results <- deliveryResult{delivery: d, request: req, err: err, requeue: err != nil}
 			}(delivery)
 		case result := <-results:
 			inFlight--
 			if result.err == nil {
-				_ = result.delivery.Ack(false)
+				_ = channelOps.Ack(result.delivery)
 			} else if result.requeue {
 				slog.Error("process failed, requeuing",
 					"campaign_id", result.request.CampaignID,
 					"user_id", result.request.UserID,
 					"channel", result.request.ChannelCode,
 					"error", result.err)
-				_ = result.delivery.Nack(false, true)
+				_ = channelOps.Nack(result.delivery, true)
 			} else {
-				_ = result.delivery.Nack(false, false)
+				_ = channelOps.Nack(result.delivery, false)
 			}
 		}
 	}
+}
+
+func workerPrefetch() int {
+	prefetch := appruntime.EnvInt("WORKER_PREFETCH", 20)
+	if prefetch < 1 {
+		return 1
+	}
+	return prefetch
+}
+
+type amqpChannelOps struct {
+	ch *amqp.Channel
+	mu sync.Mutex
+}
+
+func newAMQPChannelOps(ch *amqp.Channel) *amqpChannelOps {
+	if ch == nil {
+		return nil
+	}
+	return &amqpChannelOps{ch: ch}
+}
+
+func (ops *amqpChannelOps) Ack(delivery amqp.Delivery) error {
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	return delivery.Ack(false)
+}
+
+func (ops *amqpChannelOps) Nack(delivery amqp.Delivery, requeue bool) error {
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	return delivery.Nack(false, requeue)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +338,9 @@ func sendOnce(w http.ResponseWriter, r *http.Request) {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
 	}
 	pubMu.Lock()
-	ch := pubCh
+	ops := pubOps
 	pubMu.Unlock()
-	if err := processWithChannel(r.Context(), ch, req); err != nil {
+	if err := processWithPublisher(r.Context(), ops, req); err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -295,6 +352,10 @@ func sendOnce(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.SendMessageRequest) error {
+	return processWithPublisher(ctx, newAMQPChannelOps(ch), req)
+}
+
+func processWithPublisher(ctx context.Context, publisher *amqpChannelOps, req contracts.SendMessageRequest) error {
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
 	}
@@ -330,12 +391,16 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 	if err != nil {
 		return err
 	}
+	var progressEvent *contracts.CampaignProgressEvent
 	if writeResult.Applied {
-		if err := updateCampaignCounters(ctx, req.CampaignID, writeResult.PreviousStatus, status); err != nil {
+		snapshot, err := refreshCampaignCounters(ctx, req.CampaignID)
+		if err != nil {
 			return err
 		}
+		event := campaignProgressEvent(snapshot)
+		progressEvent = &event
 	}
-	if ch == nil {
+	if publisher == nil {
 		return nil
 	}
 	eventType := "message.sent"
@@ -348,17 +413,75 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 		ErrorCode: result.ErrorCode, ErrorMessage: result.Error, Attempt: req.Attempt,
 		IdempotencyKey: req.IdempotencyKey, FinishedAt: result.FinishedAt,
 	}
-	if err := appruntime.PublishJSON(ctx, ch, appruntime.ExchangeMessageStatus, eventType, event); err != nil {
-		return err
-	}
-	if status == "failed" && req.Attempt < config.RetryLimit {
-		req.Attempt++
-		return appruntime.PublishJSON(ctx, ch, "", appruntime.QueueMessageRetry, req)
-	}
-	if status == "failed" {
-		return appruntime.PublishJSON(ctx, ch, "", appruntime.QueueMessageDLQ, req)
+	if err := publishDeliverySideEffects(ctx, publisher, req, status, config, eventType, event, progressEvent); err != nil {
+		return acknowledgePostCommitPublishError(req, err)
 	}
 	return nil
+}
+
+type failureRoute struct {
+	queue    string
+	priority uint8
+	request  contracts.SendMessageRequest
+}
+
+func publishDeliverySideEffects(ctx context.Context, publisher *amqpChannelOps, req contracts.SendMessageRequest, status string, config channels.Config, eventType string, event contracts.MessageStatusEvent, progressEvent *contracts.CampaignProgressEvent) error {
+	var firstErr error
+	rememberErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	rememberErr(publisher.PublishJSON(ctx, appruntime.ExchangeMessageStatus, eventType, 0, event))
+	if status == "failed" {
+		if route, ok := nextFailureRoute(req, config); ok {
+			rememberErr(publisher.PublishJSON(ctx, "", route.queue, route.priority, route.request))
+		}
+	}
+	if progressEvent != nil {
+		rememberErr(publisher.PublishJSON(ctx, appruntime.ExchangeCampaignStatus, "campaign.progress", 0, *progressEvent))
+	}
+	return firstErr
+}
+
+func nextFailureRoute(req contracts.SendMessageRequest, config channels.Config) (failureRoute, bool) {
+	if req.Attempt < config.RetryLimit {
+		req.Attempt++
+		return failureRoute{queue: appruntime.QueueMessageRetry, priority: automaticRetryPriority, request: req}, true
+	}
+	return failureRoute{queue: appruntime.QueueMessageDLQ, priority: automaticRetryPriority, request: req}, true
+}
+
+func acknowledgePostCommitPublishError(req contracts.SendMessageRequest, err error) error {
+	if err != nil {
+		slog.Error("delivery side-effect publish failed after db commit; acking processed delivery",
+			"campaign_id", req.CampaignID,
+			"user_id", req.UserID,
+			"channel", req.ChannelCode,
+			"idempotency_key", req.IdempotencyKey,
+			"error", err)
+	}
+	return nil
+}
+
+func (ops *amqpChannelOps) PublishJSON(ctx context.Context, exchange, routingKey string, priority uint8, payload any) error {
+	if ops == nil || ops.ch == nil {
+		return nil
+	}
+	publishCtx, cancel := context.WithTimeout(ctx, workerPublishTimeout())
+	defer cancel()
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	return appruntime.PublishJSONPriority(publishCtx, ops.ch, exchange, routingKey, priority, payload)
+}
+
+func workerPublishTimeout() time.Duration {
+	milliseconds := appruntime.EnvInt("WORKER_PUBLISH_TIMEOUT_MS", 2000)
+	if milliseconds <= 0 {
+		milliseconds = 2000
+	}
+	return time.Duration(milliseconds) * time.Millisecond
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +752,17 @@ type deliveryWriteResult struct {
 	PreviousStatus string
 }
 
+type campaignCounterSnapshot struct {
+	CampaignID    string
+	Status        string
+	TotalMessages int
+	Processed     int
+	Success       int
+	Failed        int
+	Cancelled     int
+	P95DispatchMs int
+}
+
 func writeDelivery(ctx context.Context, req contracts.SendMessageRequest, status string, result channels.Result) (deliveryWriteResult, error) {
 	var previousStatus string
 	var previousAttempt int
@@ -678,41 +812,83 @@ func canApplyDeliveryResult(previousStatus string, previousAttempt, nextAttempt 
 	return false
 }
 
-func updateCampaignCounters(ctx context.Context, campaignID, previousStatus, status string) error {
-	if previousStatus == "failed" {
-		if status != "sent" {
-			return nil
+func refreshCampaignCounters(ctx context.Context, campaignID string) (campaignCounterSnapshot, error) {
+	row := db.QueryRow(ctx, `
+		WITH delivery_counts AS (
+			SELECT
+				(count(*) FILTER (WHERE status IN ('sent', 'failed', 'cancelled')))::int AS processed,
+				(count(*) FILTER (WHERE status = 'sent'))::int AS success,
+				(count(*) FILTER (WHERE status = 'failed'))::int AS failed,
+				(count(*) FILTER (WHERE status = 'cancelled'))::int AS cancelled
+			FROM message_deliveries
+			WHERE campaign_id = $1
+		),
+		updated AS (
+			UPDATE campaigns c
+			SET sent_count = delivery_counts.processed,
+			    success_count = delivery_counts.success,
+			    failed_count = delivery_counts.failed,
+			    cancelled_count = delivery_counts.cancelled,
+			    status = CASE
+			        WHEN delivery_counts.processed >= c.total_messages
+			          AND c.total_messages > 0
+			          AND c.status IN ($3, $4) THEN $2
+			        ELSE c.status
+			    END,
+			    finished_at = CASE
+			        WHEN delivery_counts.processed >= c.total_messages
+			          AND c.total_messages > 0
+			          AND c.status IN ($3, $4) THEN COALESCE(c.finished_at, now())
+			        WHEN c.status IN ($3, $4) THEN NULL
+			        ELSE c.finished_at
+			    END,
+			    updated_at = now()
+			FROM delivery_counts
+			WHERE c.id = $1
+			RETURNING c.id, c.status, c.total_messages, c.sent_count, c.success_count, c.failed_count, c.cancelled_count, c.p95_dispatch_ms
+		)
+		SELECT id, status, total_messages, sent_count, success_count, failed_count, cancelled_count, p95_dispatch_ms
+		FROM updated`, campaignID, campaigns.StatusFinished, campaigns.StatusRunning, campaigns.StatusRetrying)
+
+	var snapshot campaignCounterSnapshot
+	err := row.Scan(
+		&snapshot.CampaignID,
+		&snapshot.Status,
+		&snapshot.TotalMessages,
+		&snapshot.Processed,
+		&snapshot.Success,
+		&snapshot.Failed,
+		&snapshot.Cancelled,
+		&snapshot.P95DispatchMs,
+	)
+	return snapshot, err
+}
+
+func shouldFinishCampaign(status string, processed, totalMessages int) bool {
+	return (status == campaigns.StatusRunning || status == campaigns.StatusRetrying) && totalMessages > 0 && processed >= totalMessages
+}
+
+func campaignProgressEvent(snapshot campaignCounterSnapshot) contracts.CampaignProgressEvent {
+	progress := 0.0
+	if snapshot.TotalMessages > 0 {
+		progress = float64(snapshot.Processed) / float64(snapshot.TotalMessages) * 100
+		if progress > 100 {
+			progress = 100
 		}
-		_, err := db.Exec(ctx, `
-			UPDATE campaigns
-			SET failed_count = GREATEST(failed_count - 1, 0),
-			    success_count = success_count + 1,
-			    status = CASE WHEN sent_count >= total_messages THEN $2 ELSE status END,
-			    finished_at = CASE WHEN sent_count >= total_messages THEN now() ELSE finished_at END,
-			    updated_at = now()
-			WHERE id = $1`, campaignID, campaigns.StatusFinished)
-		return err
 	}
-	if status == "sent" {
-		_, err := db.Exec(ctx, `
-			UPDATE campaigns
-			SET sent_count = sent_count + 1,
-			    success_count = success_count + 1,
-			    status = CASE WHEN sent_count + 1 >= total_messages THEN $2 ELSE status END,
-			    finished_at = CASE WHEN sent_count + 1 >= total_messages THEN now() ELSE finished_at END,
-			    updated_at = now()
-			WHERE id = $1`, campaignID, campaigns.StatusFinished)
-		return err
+	return contracts.CampaignProgressEvent{
+		Type:            "campaign.progress",
+		CampaignID:      snapshot.CampaignID,
+		Status:          snapshot.Status,
+		TotalMessages:   snapshot.TotalMessages,
+		Processed:       snapshot.Processed,
+		Success:         snapshot.Success,
+		Failed:          snapshot.Failed,
+		Cancelled:       snapshot.Cancelled,
+		P95DispatchMs:   snapshot.P95DispatchMs,
+		ProgressPercent: progress,
+		UpdatedAt:       time.Now().UTC(),
 	}
-	_, err := db.Exec(ctx, `
-		UPDATE campaigns
-		SET sent_count = sent_count + 1,
-		    failed_count = failed_count + 1,
-		    status = CASE WHEN sent_count + 1 >= total_messages THEN $2 ELSE status END,
-		    finished_at = CASE WHEN sent_count + 1 >= total_messages THEN now() ELSE finished_at END,
-		    updated_at = now()
-		WHERE id = $1`, campaignID, campaigns.StatusFinished)
-	return err
 }
 
 func newID(prefix string) string {

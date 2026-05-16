@@ -436,12 +436,14 @@ def worker_control_mode() -> str:
 
 
 def worker_control_enabled() -> bool:
-    return worker_control_mode() in {"kubernetes", "memory"}
+    return worker_control_mode() in {"kubernetes", "keda", "memory"}
 
 
 def worker_autoscaler_name() -> str:
     if worker_control_mode() == "kubernetes":
         return "kubernetes-hpa"
+    if worker_control_mode() == "keda":
+        return "keda-rabbitmq"
     if worker_control_mode() == "memory":
         return "ops-gateway-memory"
     return "read-only"
@@ -458,6 +460,12 @@ def worker_max_replicas() -> int:
 async def read_worker_scaling_policy() -> dict[str, int]:
     if worker_control_mode() == "kubernetes":
         return read_kubernetes_worker_scaling_policy()
+    if worker_control_mode() == "keda":
+        try:
+            return read_keda_worker_scaling_policy()
+        except Exception as exc:
+            logger.warning("keda worker scaling policy unavailable: %s", exc)
+            return await read_keda_fallback_worker_scaling_policy()
     if worker_control_mode() == "disabled":
         return read_dns_worker_replicas()
     cached = await read_worker_scaling_policy_from_redis()
@@ -490,9 +498,39 @@ def read_dns_worker_replicas() -> dict[str, int]:
     }
 
 
+def read_deployment_worker_scaling_policy(min_replicas: int | None = None, max_replicas: int | None = None) -> dict[str, int]:
+    deployment = kubernetes_deployment_request("GET")
+    status = deployment.get("status", {})
+    spec = deployment.get("spec", {})
+    desired = int(spec.get("replicas") or min_replicas or 1)
+    active = int(status.get("readyReplicas") or status.get("replicas") or desired)
+    min_value = int(min_replicas if min_replicas is not None else desired)
+    max_value = int(max_replicas if max_replicas is not None else max(desired, worker_max_replicas()))
+    return {"replicas": active, "desired_replicas": desired, "min_replicas": min_value, "max_replicas": max(min_value, max_value)}
+
+
+async def read_keda_fallback_worker_scaling_policy() -> dict[str, int]:
+    cached = await read_worker_scaling_policy_from_redis()
+    try:
+        if cached:
+            policy = read_deployment_worker_scaling_policy(cached["min_replicas"], cached["max_replicas"])
+            policy["desired_replicas"] = max(policy["min_replicas"], min(policy["desired_replicas"], policy["max_replicas"]))
+            return policy
+        return read_deployment_worker_scaling_policy()
+    except Exception as exc:
+        logger.warning("deployment worker scaling fallback unavailable: %s", exc)
+        return cached or read_dns_worker_replicas()
+
+
 async def apply_worker_bounds(min_replicas: int, max_replicas: int) -> dict[str, int]:
     if worker_control_mode() == "kubernetes":
         return apply_kubernetes_worker_bounds(min_replicas, max_replicas)
+    if worker_control_mode() == "keda":
+        try:
+            return apply_keda_worker_bounds(min_replicas, max_replicas)
+        except Exception as exc:
+            logger.warning("keda worker bounds unavailable, using deployment fallback: %s", exc)
+            return await apply_keda_fallback_worker_bounds(min_replicas, max_replicas)
     if worker_control_mode() != "memory":
         raise RuntimeError("worker_control_disabled")
     worker_bounds_state["min_replicas"] = min_replicas
@@ -531,6 +569,46 @@ def apply_kubernetes_worker_bounds(min_replicas: int, max_replicas: int) -> dict
     return {"replicas": active, "desired_replicas": desired, "min_replicas": current_min, "max_replicas": current_max}
 
 
+def read_keda_worker_scaling_policy() -> dict[str, int]:
+    scaled_object = kubernetes_scaled_object_request("GET")
+    deployment = kubernetes_deployment_request("GET")
+    spec = scaled_object.get("spec", {})
+    min_replicas = int(spec.get("minReplicaCount") or 1)
+    max_replicas = int(spec.get("maxReplicaCount") or worker_max_replicas())
+    deployment_status = deployment.get("status", {})
+    deployment_spec = deployment.get("spec", {})
+    active = int(deployment_status.get("readyReplicas") or deployment_status.get("replicas") or deployment_spec.get("replicas") or min_replicas)
+    desired = int(deployment_spec.get("replicas") or active)
+    return {"replicas": active, "desired_replicas": desired, "min_replicas": min_replicas, "max_replicas": max_replicas}
+
+
+def apply_keda_worker_bounds(min_replicas: int, max_replicas: int) -> dict[str, int]:
+    payload = kubernetes_scaled_object_request("PATCH", {"spec": {"minReplicaCount": min_replicas, "maxReplicaCount": max_replicas}})
+    spec = payload.get("spec", {})
+    current_min = int(spec.get("minReplicaCount") or min_replicas)
+    current_max = int(spec.get("maxReplicaCount") or max_replicas)
+    policy = read_keda_worker_scaling_policy()
+    policy["min_replicas"] = current_min
+    policy["max_replicas"] = current_max
+    return policy
+
+
+async def apply_keda_fallback_worker_bounds(min_replicas: int, max_replicas: int) -> dict[str, int]:
+    current = read_deployment_worker_scaling_policy(min_replicas, max_replicas)
+    desired = max(min_replicas, min(int(current["desired_replicas"]), max_replicas))
+    if desired != current["desired_replicas"]:
+        kubernetes_deployment_request("PATCH", {"spec": {"replicas": desired}})
+        current = read_deployment_worker_scaling_policy(min_replicas, max_replicas)
+    policy = {
+        "replicas": int(current["replicas"]),
+        "desired_replicas": desired,
+        "min_replicas": min_replicas,
+        "max_replicas": max_replicas,
+    }
+    await write_worker_scaling_policy_to_redis(policy)
+    return policy
+
+
 def kubernetes_hpa_request(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     namespace = os.getenv("WORKER_K8S_NAMESPACE", os.getenv("POD_NAMESPACE", "norify"))
     hpa = os.getenv("WORKER_K8S_HPA", os.getenv("WORKER_K8S_DEPLOYMENT", "sender-worker"))
@@ -544,6 +622,34 @@ def kubernetes_hpa_request(method: str, payload: dict[str, Any] | None = None) -
     body = None if payload is None else json.dumps(payload).encode()
     content_type = "application/merge-patch+json" if method == "PATCH" else "application/json"
     request = urllib.request.Request(url, data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": content_type}, method=method)
+    context = ssl.create_default_context(cafile=ca_path if os.path.exists(ca_path) else None)
+    with urllib.request.urlopen(request, timeout=10, context=context) as response:
+        raw = response.read()
+        return json.loads(raw.decode()) if raw else {}
+
+
+def kubernetes_scaled_object_request(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    namespace = os.getenv("WORKER_K8S_NAMESPACE", os.getenv("POD_NAMESPACE", "norify"))
+    name = os.getenv("WORKER_K8S_SCALED_OBJECT", os.getenv("WORKER_K8S_DEPLOYMENT", "sender-worker"))
+    return kubernetes_api_request(method, f"/apis/keda.sh/v1alpha1/namespaces/{namespace}/scaledobjects/{name}", payload)
+
+
+def kubernetes_deployment_request(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    namespace = os.getenv("WORKER_K8S_NAMESPACE", os.getenv("POD_NAMESPACE", "norify"))
+    name = os.getenv("WORKER_K8S_DEPLOYMENT", "sender-worker")
+    return kubernetes_api_request(method, f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}", payload)
+
+
+def kubernetes_api_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    host = os.getenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.getenv("KUBERNETES_SERVICE_PORT", "443")
+    token_path = os.getenv("KUBERNETES_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
+    ca_path = os.getenv("KUBERNETES_CA_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    with open(token_path, encoding="utf-8") as token_file:
+        token = token_file.read().strip()
+    body = None if payload is None else json.dumps(payload).encode()
+    content_type = "application/merge-patch+json" if method == "PATCH" else "application/json"
+    request = urllib.request.Request(f"https://{host}:{port}{path}", data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": content_type}, method=method)
     context = ssl.create_default_context(cafile=ca_path if os.path.exists(ca_path) else None)
     with urllib.request.urlopen(request, timeout=10, context=context) as response:
         raw = response.read()
@@ -570,12 +676,7 @@ async def consume_rabbitmq(rabbitmq_url: str) -> None:
             logger.info("connected to rabbitmq status events")
             async with connection:
                 channel = await connection.channel()
-                message_queue = await channel.declare_queue("message.status.events", durable=True)
-                campaign_queue = await channel.declare_queue("campaign.status.events", durable=True)
-                result_queue = await channel.declare_queue("message.send.result", durable=True)
-                error_queue = await channel.declare_queue("message.send.error", durable=True)
-                await message_queue.bind("message.status.events", routing_key="#")
-                await campaign_queue.bind("campaign.status.events", routing_key="#")
+                message_queue, campaign_queue, result_queue, error_queue = await declare_status_topology(channel)
                 await asyncio.gather(
                     consume_queue(message_queue, apply_message_event),
                     consume_queue(campaign_queue, apply_campaign_event),
@@ -585,6 +686,20 @@ async def consume_rabbitmq(rabbitmq_url: str) -> None:
         except Exception:
             logger.exception("rabbitmq status consumer failed")
             await asyncio.sleep(2)
+
+
+async def declare_status_topology(channel: Any) -> tuple[Any, Any, Any, Any]:
+    exchange_type = getattr(aio_pika, "ExchangeType", None)
+    topic_type = exchange_type.TOPIC if exchange_type else "topic"
+    message_exchange = await channel.declare_exchange("message.status.events", type=topic_type, durable=True)
+    campaign_exchange = await channel.declare_exchange("campaign.status.events", type=topic_type, durable=True)
+    message_queue = await channel.declare_queue("message.status.events", durable=True)
+    campaign_queue = await channel.declare_queue("campaign.status.events", durable=True)
+    result_queue = await channel.declare_queue("message.send.result", durable=True)
+    error_queue = await channel.declare_queue("message.send.error", durable=True)
+    await message_queue.bind(message_exchange, routing_key="#")
+    await campaign_queue.bind(campaign_exchange, routing_key="#")
+    return message_queue, campaign_queue, result_queue, error_queue
 
 
 async def consume_queue(queue: Any, handler: Any) -> None:
@@ -633,25 +748,6 @@ async def apply_message_event(payload: dict[str, Any]) -> None:
     campaign_totals[campaign_id] = total
     key = event_key(payload)
     message_states.setdefault(campaign_id, {})[key] = str(payload.get("status") or "")
-    states = message_states[campaign_id].values()
-    success = sum(1 for status in states if status == "sent")
-    failed = sum(1 for status in states if status == "failed")
-    cancelled = sum(1 for status in states if status == "cancelled")
-    processed = success + failed + cancelled
-    snapshot = ProgressSnapshot(
-        campaign_id=campaign_id,
-        status=current.status,
-        total_messages=total,
-        processed=processed,
-        success=success,
-        failed=failed,
-        cancelled=cancelled,
-        p95_dispatch_ms=current.p95_dispatch_ms,
-        progress_percent=min(100, round(processed / total * 100, 2)) if total else 0,
-        updated_at=datetime.now(timezone.utc),
-    )
-    await remember_campaign_snapshot(snapshot)
-    await broadcast(campaign_id, snapshot.model_dump(mode="json"))
 
 
 async def apply_worker_result_payload(payload: dict[str, Any]) -> bool:
@@ -683,17 +779,17 @@ async def apply_worker_result_event(result: MessageSendResult) -> bool:
 async def apply_campaign_event(payload: dict[str, Any]) -> None:
     campaign_id = payload["campaign_id"]
     current = await read_campaign_snapshot(campaign_id)
-    total = int(payload.get("total_messages") or current.total_messages)
-    processed = int(payload.get("processed") or current.processed)
+    total = int(payload["total_messages"]) if "total_messages" in payload else current.total_messages
+    processed = int(payload["processed"]) if "processed" in payload else current.processed
     snapshot = ProgressSnapshot(
         campaign_id=campaign_id,
         status=str(payload.get("status") or current.status),
         total_messages=total,
         processed=processed,
-        success=int(payload.get("success") or current.success),
-        failed=int(payload.get("failed") or current.failed),
-        cancelled=int(payload.get("cancelled") or current.cancelled),
-        p95_dispatch_ms=int(payload.get("p95_dispatch_ms") or current.p95_dispatch_ms),
+        success=int(payload["success"]) if "success" in payload else current.success,
+        failed=int(payload["failed"]) if "failed" in payload else current.failed,
+        cancelled=int(payload["cancelled"]) if "cancelled" in payload else current.cancelled,
+        p95_dispatch_ms=int(payload["p95_dispatch_ms"]) if "p95_dispatch_ms" in payload else current.p95_dispatch_ms,
         progress_percent=min(100, round(processed / total * 100, 2)) if total else current.progress_percent,
         updated_at=datetime.now(timezone.utc),
     )
@@ -956,31 +1052,44 @@ def write_delivery_result_sync(result: MessageSendResult) -> bool:
             )
             applied = cur.rowcount > 0
             if applied:
-                if result.status == "sent":
-                    cur.execute(
-                        """
-                        UPDATE campaigns
-                        SET sent_count = sent_count + 1,
-                            success_count = success_count + 1,
-                            status = CASE WHEN sent_count + 1 >= total_messages THEN 'finished' ELSE status END,
-                            finished_at = CASE WHEN sent_count + 1 >= total_messages THEN now() ELSE finished_at END,
-                            updated_at = now()
-                        WHERE id = %s
-                        """,
-                        (result.campaign_id,),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE campaigns
-                        SET sent_count = sent_count + 1,
-                            failed_count = failed_count + 1,
-                            status = CASE WHEN sent_count + 1 >= total_messages THEN 'finished' ELSE status END,
-                            finished_at = CASE WHEN sent_count + 1 >= total_messages THEN now() ELSE finished_at END,
-                            updated_at = now()
-                        WHERE id = %s
-                        """,
-                        (result.campaign_id,),
-                    )
+                refresh_campaign_counters(cur, result.campaign_id)
         conn.commit()
     return applied
+
+
+def refresh_campaign_counters(cur: Any, campaign_id: str) -> None:
+    cur.execute(
+        """
+        WITH delivery_counts AS (
+            SELECT
+                (count(*) FILTER (WHERE status IN ('sent', 'failed', 'cancelled')))::int AS processed,
+                (count(*) FILTER (WHERE status = 'sent'))::int AS success,
+                (count(*) FILTER (WHERE status = 'failed'))::int AS failed,
+                (count(*) FILTER (WHERE status = 'cancelled'))::int AS cancelled
+            FROM message_deliveries
+            WHERE campaign_id = %s
+        )
+        UPDATE campaigns c
+        SET sent_count = delivery_counts.processed,
+            success_count = delivery_counts.success,
+            failed_count = delivery_counts.failed,
+            cancelled_count = delivery_counts.cancelled,
+            status = CASE
+                WHEN delivery_counts.processed >= c.total_messages
+                  AND c.total_messages > 0
+                  AND c.status IN ('running', 'retrying') THEN 'finished'
+                ELSE c.status
+            END,
+            finished_at = CASE
+                WHEN delivery_counts.processed >= c.total_messages
+                  AND c.total_messages > 0
+                  AND c.status IN ('running', 'retrying') THEN COALESCE(c.finished_at, now())
+                WHEN c.status IN ('running', 'retrying') THEN NULL
+                ELSE c.finished_at
+            END,
+            updated_at = now()
+        FROM delivery_counts
+        WHERE c.id = %s
+        """,
+        (campaign_id, campaign_id),
+    )

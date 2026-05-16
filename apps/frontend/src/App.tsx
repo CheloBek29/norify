@@ -39,6 +39,7 @@ import {
   normalizeCampaign,
   normalizeStatsSnapshot,
   operationsWebSocketURL,
+  sendCampaignAction,
   serviceHealthTargets,
   statsStreamURL,
   type StatsSnapshot,
@@ -91,9 +92,10 @@ export function App() {
   const [healthChecks, setHealthChecks] = useState<ServiceHealth[]>(initialHealthChecks);
   const [statsSnapshot, setStatsSnapshot] = useState<StatsSnapshot | null>(null);
   const [statsState, setStatsState] = useState("stats connecting");
-  const [selectedCampaignId, setSelectedCampaignId] = useState(campaigns[0]?.id ?? "");
+  const [selectedCampaignId, setSelectedCampaignId] = useLocalState("norify-selected-campaign-id", campaigns[0]?.id ?? "");
   const [apiState, setApiState] = useState("connecting");
   const [opsConnected, setOpsConnected] = useState(false);
+  const [campaignServiceAvailable, setCampaignServiceAvailable] = useState(false);
   const [pendingActionKeys, setPendingActionKeys] = useState<string[]>([]);
   const [createPending, setCreatePending] = useState(false);
   const opsSocketRef = useRef<WebSocket | null>(null);
@@ -104,6 +106,8 @@ export function App() {
   const activeError = selectedCampaign ? buildError(selectedCampaign) : emptyActionableError();
   const backendAvailable = healthChecks.some((check) => check.status === "ready");
   const commandsAvailable = opsConnected;
+  const campaignCommandsAvailable = opsConnected || campaignServiceAvailable;
+  const displayedApiState = opsConnected ? "websocket commands" : campaignServiceAvailable ? "live backend" : apiState;
 
   useEffect(() => {
     const path = pathForScreen(screen);
@@ -193,10 +197,14 @@ export function App() {
     ]);
     const hasLiveData = [nextCampaigns, nextTemplates, nextChannels, nextTemplateVariables].some((result) => result.status === "fulfilled");
     let activeCampaignId = "";
-    if (nextCampaigns.status === "fulfilled" && nextCampaigns.value.length > 0) {
+    if (nextCampaigns.status === "fulfilled") {
+      setCampaignServiceAvailable(true);
       setCampaigns(nextCampaigns.value);
-      activeCampaignId = nextCampaigns.value.find((campaign) => !campaign.archivedAt)?.id || nextCampaigns.value[0].id;
-      setSelectedCampaignId((current) => current || activeCampaignId);
+      const fallbackCampaignId = nextCampaigns.value.find((campaign) => !campaign.archivedAt)?.id || nextCampaigns.value[0]?.id || "";
+      activeCampaignId = nextCampaigns.value.some((campaign) => campaign.id === selectedCampaignId) ? selectedCampaignId : fallbackCampaignId;
+      setSelectedCampaignId(activeCampaignId);
+    } else if (nextCampaigns.status === "rejected") {
+      setCampaignServiceAvailable(false);
     }
     if (nextTemplates.status === "fulfilled" && nextTemplates.value.length > 0) setTemplates(nextTemplates.value);
     if (nextTemplateVariables.status === "fulfilled" && nextTemplateVariables.value.length > 0) setTemplateVariables(nextTemplateVariables.value);
@@ -326,6 +334,20 @@ export function App() {
         reject(new Error("websocket_timeout"));
       }, 8000);
     });
+  }
+
+  async function sendCampaignCommand(campaignId: string, action: CampaignCommand) {
+    if (opsConnected) {
+      try {
+        const message = await sendOpsCommand("campaign.action", { campaign_id: campaignId, action });
+        if (message.campaign) return normalizeCampaign(message.campaign as Record<string, unknown>);
+      } catch {
+        setOpsConnected(false);
+      }
+    }
+    const campaign = await sendCampaignAction(campaignId, action);
+    setCampaignServiceAvailable(true);
+    return campaign;
   }
 
   function isActionPending(key: string) {
@@ -477,16 +499,15 @@ export function App() {
   async function handleCampaignAction(action: CampaignCommand, campaignId = selectedCampaign?.id) {
     const targetCampaign = campaigns.find((campaign) => campaign.id === campaignId);
     if (!targetCampaign) return;
-    if (!commandsAvailable) {
+    if (!campaignCommandsAvailable) {
       addEvent("error", `campaign.${action}.blocked`, `${targetCampaign.name}: backend command channel is offline`, "frontend");
       return;
     }
     const key = campaignActionKey(targetCampaign.id, action);
     await runPendingAction(key, async () => {
       try {
-        const message = await sendOpsCommand("campaign.action", { campaign_id: targetCampaign.id, action });
-        if (message.campaign) {
-          const updated = normalizeCampaign(message.campaign as Record<string, unknown>);
+        const updated = await sendCampaignCommand(targetCampaign.id, action);
+        if (updated.id) {
           setCampaigns((items) => items.map((campaign) => campaign.id === updated.id ? mergeCampaignUpdate(campaign, updated) : campaign));
           if (action === "archive" && selectedCampaign?.id === targetCampaign.id) {
             const nextActive = campaigns.find((campaign) => campaign.id !== targetCampaign.id && !campaign.archivedAt);
@@ -496,7 +517,7 @@ export function App() {
         if (action !== "start" && action !== "stop") {
           setErrorGroups((items) => items.filter((group) => group.campaignId !== targetCampaign.id));
         }
-        setApiState("websocket commands");
+        setApiState(opsConnected ? "websocket commands" : "live backend");
         addEvent("info", `campaign.${action}`, `${targetCampaign.name}: backend confirmed ${action}`, "campaign-service");
       } catch (error) {
         setApiState("backend offline");
@@ -587,11 +608,11 @@ export function App() {
             <p>{subtitleFor(screen)}</p>
           </div>
           <div className="topbarActions">
-            <span className="apiState">{apiState}</span>
+            <span className="apiState">{displayedApiState}</span>
             <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
-        {apiState === "backend offline" && !commandsAvailable && (
+        {displayedApiState === "backend offline" && !campaignCommandsAvailable && (
           <div className="fallbackBanner" role="alert">
             Backend недоступен. Действия заблокированы до восстановления соединения; локальные демо-данные не считаются реальной доставкой.
           </div>
@@ -607,9 +628,10 @@ export function App() {
             onGroupAction={handleErrorGroupAction}
             pendingActionKeys={pendingActionKeys}
             commandsAvailable={commandsAvailable}
+            campaignCommandsAvailable={campaignCommandsAvailable}
           />
         )}
-        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} pendingActionKeys={pendingActionKeys} commandsAvailable={commandsAvailable} />}
+        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} pendingActionKeys={pendingActionKeys} commandsAvailable={campaignCommandsAvailable} />}
         {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} pending={createPending} commandsAvailable={commandsAvailable} />}
         {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
@@ -810,6 +832,7 @@ function Dashboard({
   onGroupAction,
   pendingActionKeys,
   commandsAvailable,
+  campaignCommandsAvailable,
 }: {
   campaign: Campaign;
   channels: Channel[];
@@ -819,6 +842,7 @@ function Dashboard({
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
   pendingActionKeys: string[];
   commandsAvailable: boolean;
+  campaignCommandsAvailable: boolean;
 }) {
   const percent = progressPercent(campaign);
   const totalMessages = effectiveTotalMessages(campaign);
@@ -834,11 +858,10 @@ function Dashboard({
           </div>
         </div>
         <div className="campaignControlBar">
-          <CampaignPlayerControls campaign={campaign} onAction={onAction} pendingActionKeys={pendingActionKeys} commandsAvailable={commandsAvailable} />
+          <CampaignPlayerControls campaign={campaign} onAction={onAction} pendingActionKeys={pendingActionKeys} commandsAvailable={campaignCommandsAvailable} />
           {campaign.failed > 0 && (
             <div className="recoveryActions" aria-label="Campaign recovery actions">
-              <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
-              <span className="inlineNotice">Смена канала для всей кампании отключена: используйте группы ошибок.</span>
+              <button disabled={!campaignCommandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
             </div>
           )}
         </div>
@@ -954,7 +977,6 @@ function ErrorGroupsPanel({
           {campaign.failed > 0 && (
             <div className="buttonRow">
               <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
-              <span className="inlineNotice">Смена канала для всей кампании отключена: требуется точная маршрутизация по конкретным ошибочным доставкам.</span>
               <button className="danger" disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
             </div>
           )}
@@ -1463,7 +1485,7 @@ function CreateCampaign({ templates, channels, onCreate, pending, commandsAvaila
   );
 }
 
-const TEMPLATE_GENERATOR_URL = "http://localhost:8091";
+const TEMPLATE_GENERATOR_URL = "/api/template-generator";
 
 type AIStyle = "professional" | "creative" | "luxury" | "minimal" | "ecommerce";
 

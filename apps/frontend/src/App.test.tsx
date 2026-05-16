@@ -510,6 +510,61 @@ describe("App", () => {
     expect(request.payload.name).toBe("Моментальный запуск");
   });
 
+  it("keeps the selected dashboard campaign after a page refresh", async () => {
+    window.localStorage.setItem("norify-campaigns", JSON.stringify([
+      {
+        id: "cmp-first",
+        name: "Первая кампания",
+        templateId: "tpl-reactivation",
+        templateName: "Реактивация клиента",
+        status: "running",
+        filters: {},
+        selectedChannels: ["email"],
+        totalRecipients: 10,
+        totalMessages: 10,
+        processed: 1,
+        success: 1,
+        failed: 0,
+        cancelled: 0,
+        p95DispatchMs: 12,
+        createdAt: "2026-05-15T12:00:00Z",
+      },
+      {
+        id: "cmp-second",
+        name: "Вторая кампания",
+        templateId: "tpl-reactivation",
+        templateName: "Реактивация клиента",
+        status: "running",
+        filters: {},
+        selectedChannels: ["email"],
+        totalRecipients: 20,
+        totalMessages: 20,
+        processed: 2,
+        success: 2,
+        failed: 0,
+        cancelled: 0,
+        p95DispatchMs: 24,
+        createdAt: "2026-05-15T12:01:00Z",
+      },
+    ]));
+
+    const { unmount } = render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Кампании" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Вторая кампания" }));
+    fireEvent.click(screen.getByRole("button", { name: "Панель" }));
+
+    expect(await screen.findByRole("heading", { name: "Вторая кампания" })).toBeTruthy();
+    expect(window.localStorage.getItem("norify-selected-campaign-id")).toBe(JSON.stringify("cmp-second"));
+
+    unmount();
+    window.history.replaceState(null, "", "/");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Вторая кампания" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Первая кампания" })).toBeNull();
+  });
+
   it("sends selected user ids when creating a specific campaign", async () => {
     render(<App />);
     login();
@@ -718,6 +773,84 @@ describe("App", () => {
       expect(messages?.some((message) => message.type === "campaign.action" && message.payload.action === "stop")).toBe(true);
       expect(messages?.some((message) => message.type === "campaign.action" && message.payload.action === "start")).toBe(true);
     });
+  });
+
+  it("keeps stopped campaign controls usable while ops websocket reconnects", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/campaigns")) {
+        return Promise.resolve(new Response(JSON.stringify([campaignPayload({ status: "stopped" })]), { status: 200 }));
+      }
+      if (url.endsWith("/campaigns/cmp-spring/start") && init?.method === "POST") {
+        return Promise.resolve(new Response(JSON.stringify(campaignPayload({ status: "running" })), { status: 200 }));
+      }
+      if (url.endsWith("/campaigns/cmp-spring/error-groups")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+      }
+      return Promise.reject(new Error("backend_offline"));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    login();
+
+    const controls = await screen.findByLabelText("Campaign player controls");
+    const opsSocket = await waitFor(() => {
+      const socket = MockWebSocket.instances.find((item) => item.url.includes("/ws/ops"));
+      expect(socket).toBeTruthy();
+      return socket as MockWebSocket;
+    });
+    await act(async () => {
+      opsSocket.close();
+    });
+
+    await waitFor(() => expect(screen.getByText("live backend")).toBeTruthy());
+    const resume = within(controls).getByRole("button", { name: /Продолжить/i }) as HTMLButtonElement;
+    expect(resume.disabled).toBe(false);
+
+    fireEvent.click(resume);
+
+    await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
+    expect(fetchMock).toHaveBeenCalledWith("/api/campaign-service/campaigns/cmp-spring/start", { method: "POST" });
+  });
+
+  it("clears stale local campaigns when live backend returns an empty list", async () => {
+    window.localStorage.setItem("norify-campaigns", JSON.stringify([{
+      id: "cmp-stale",
+      name: "Старая локальная кампания",
+      templateId: "tpl-reactivation",
+      templateName: "Реактивация клиента",
+      status: "stopped",
+      filters: {},
+      selectedChannels: ["email"],
+      totalRecipients: 10,
+      totalMessages: 10,
+      processed: 1,
+      success: 1,
+      failed: 0,
+      cancelled: 0,
+      p95DispatchMs: 0,
+      createdAt: "2026-05-16T08:00:00Z",
+      startedAt: "2026-05-16T08:01:00Z",
+      finishedAt: null,
+      archivedAt: null,
+    }]));
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/campaigns")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+      }
+      if (url.endsWith("/templates") || url.endsWith("/channels") || url.endsWith("/templates/variables")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+      }
+      return Promise.reject(new Error("backend_offline"));
+    }));
+
+    render(<App />);
+    login();
+
+    await waitFor(() => expect(screen.queryByText("Старая локальная кампания")).toBeNull());
+    expect(screen.getByText("live backend")).toBeTruthy();
   });
 
   it("does not reset running campaign counters from an empty realtime snapshot", async () => {
@@ -1090,6 +1223,36 @@ describe("App", () => {
     expect(html).toContain("<strong>ok</strong>");
     expect(html).not.toContain("<img");
     expect(html).not.toContain("javascript:");
+  });
+
+  it("generates an AI template and applies it to the editor", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/generate-text")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          success: true,
+          text: "Здравствуйте, {first_name}!\n\nВесенняя распродажа уже началась.",
+          style: "professional",
+        }), { status: 200 }));
+      }
+      return Promise.reject(new Error("backend_offline"));
+    }));
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Шаблоны" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI Генератор" }));
+
+    fireEvent.change(screen.getByLabelText("Описание"), {
+      target: { value: "Сделай письмо про весеннюю распродажу" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Сгенерировать текст/i }));
+
+    expect(await screen.findByText(/Весенняя распродажа уже началась/i)).toBeTruthy();
+    expect(fetch).toHaveBeenCalledWith("/api/template-generator/api/generate-text", expect.objectContaining({ method: "POST" }));
+    fireEvent.click(screen.getByRole("button", { name: /Использовать текст/i }));
+
+    expect((screen.getByLabelText("Текст сообщения") as HTMLTextAreaElement).value).toContain("Весенняя распродажа");
   });
 
   it("applies the polished form surface to every editable workflow", async () => {

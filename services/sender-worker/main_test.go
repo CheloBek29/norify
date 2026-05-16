@@ -25,7 +25,8 @@ func TestCanProcessCampaignStatus(t *testing.T) {
 	}
 }
 
-func TestWorkerPoolDefaultsToOneWorkerPerContainer(t *testing.T) {
+func TestWorkerPoolDefaultsScaleInsideContainer(t *testing.T) {
+	t.Setenv("WORKER_CONTROL_MODE", "")
 	t.Setenv("WORKER_MIN_POOL", "")
 	t.Setenv("WORKER_MAX_POOL", "")
 
@@ -34,11 +35,123 @@ func TestWorkerPoolDefaultsToOneWorkerPerContainer(t *testing.T) {
 	if pool.min != 1 {
 		t.Fatalf("default min pool should keep one worker per container, got %d", pool.min)
 	}
-	if pool.max != 1 {
-		t.Fatalf("default max pool should keep one worker per container, got %d", pool.max)
+	if pool.max != 20 {
+		t.Fatalf("default max pool should allow in-process scale-out, got %d", pool.max)
+	}
+	if target := pool.targetSize(1000); target != pool.max {
+		t.Fatalf("queue depth must scale in-process workers to max; got target %d, max %d", target, pool.max)
+	}
+}
+
+func TestWorkerPoolDoesNotInternallyScaleUnderKubernetesHPA(t *testing.T) {
+	t.Setenv("WORKER_CONTROL_MODE", "kubernetes")
+	t.Setenv("WORKER_MIN_POOL", "5")
+	t.Setenv("WORKER_MAX_POOL", "20")
+
+	pool := newWorkerPool()
+
+	if pool.min != 1 || pool.max != 1 {
+		t.Fatalf("kubernetes HPA mode must keep one in-process worker per pod, got %d..%d", pool.min, pool.max)
 	}
 	if target := pool.targetSize(1000); target != 1 {
-		t.Fatalf("queue depth must scale containers, not in-process workers; got target %d", target)
+		t.Fatalf("kubernetes HPA mode must not add in-process workers, got target %d", target)
+	}
+}
+
+func TestWorkerPoolNormalizesInvalidBounds(t *testing.T) {
+	t.Setenv("WORKER_CONTROL_MODE", "")
+	t.Setenv("WORKER_MIN_POOL", "5")
+	t.Setenv("WORKER_MAX_POOL", "2")
+
+	pool := newWorkerPool()
+
+	if pool.min != 5 || pool.max != 5 {
+		t.Fatalf("pool bounds = %d..%d, want 5..5", pool.min, pool.max)
+	}
+}
+
+func TestWorkerPrefetchDefaultsToUsefulParallelism(t *testing.T) {
+	t.Setenv("WORKER_PREFETCH", "")
+
+	if got := workerPrefetch(); got != 20 {
+		t.Fatalf("workerPrefetch() = %d, want 20", got)
+	}
+}
+
+func TestWorkerPrefetchClampsInvalidValues(t *testing.T) {
+	t.Setenv("WORKER_PREFETCH", "0")
+
+	if got := workerPrefetch(); got != 1 {
+		t.Fatalf("workerPrefetch() = %d, want 1", got)
+	}
+}
+
+func TestPostCommitPublishFailureDoesNotRequeueProcessedDelivery(t *testing.T) {
+	if err := acknowledgePostCommitPublishError(contracts.SendMessageRequest{CampaignID: "cmp-1", IdempotencyKey: "key-1"}, assertErr("rabbit publish failed")); err != nil {
+		t.Fatalf("post-commit publish failure must ack processed delivery, got %v", err)
+	}
+}
+
+func TestFailureRoutePrioritizesFreshCampaignTrafficOverRetries(t *testing.T) {
+	route, ok := nextFailureRoute(contracts.SendMessageRequest{Attempt: 1}, defaultChannelConfig("email"))
+
+	if !ok {
+		t.Fatalf("failed delivery should route to retry")
+	}
+	if route.queue != "message.send.retry" {
+		t.Fatalf("route queue = %q, want retry", route.queue)
+	}
+	if route.priority >= freshSendPriority {
+		t.Fatalf("retry priority %d must stay below fresh send priority %d", route.priority, freshSendPriority)
+	}
+	if route.request.Attempt != 2 {
+		t.Fatalf("retry attempt = %d, want 2", route.request.Attempt)
+	}
+}
+
+type assertErr string
+
+func (e assertErr) Error() string { return string(e) }
+
+func TestShouldFinishCampaignOnlyForActiveCompleteCampaigns(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        string
+		processed     int
+		totalMessages int
+		want          bool
+	}{
+		{name: "running complete finishes", status: "running", processed: 10, totalMessages: 10, want: true},
+		{name: "retrying over complete finishes", status: "retrying", processed: 11, totalMessages: 10, want: true},
+		{name: "running incomplete stays active", status: "running", processed: 9, totalMessages: 10, want: false},
+		{name: "stopped complete is not overwritten", status: "stopped", processed: 10, totalMessages: 10, want: false},
+		{name: "cancelled complete is not overwritten", status: "cancelled", processed: 10, totalMessages: 10, want: false},
+		{name: "zero total does not finish", status: "running", processed: 1, totalMessages: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldFinishCampaign(tt.status, tt.processed, tt.totalMessages)
+			if got != tt.want {
+				t.Fatalf("shouldFinishCampaign(%q, %d, %d) = %v, want %v", tt.status, tt.processed, tt.totalMessages, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCampaignProgressEventUsesDerivedCounters(t *testing.T) {
+	event := campaignProgressEvent(campaignCounterSnapshot{
+		CampaignID:    "cmp-1",
+		Status:        "running",
+		TotalMessages: 4,
+		Processed:     3,
+		Success:       2,
+		Failed:        1,
+		Cancelled:     0,
+		P95DispatchMs: 12,
+	})
+
+	if event.Processed != 3 || event.Success != 2 || event.Failed != 1 || event.ProgressPercent != 75 {
+		t.Fatalf("unexpected progress event: %#v", event)
 	}
 }
 

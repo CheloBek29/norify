@@ -1,4 +1,21 @@
 import os
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - python-dotenv is installed in the service image
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
+
+ROOT_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+
+
+def load_service_env(dotenv_path: Path = ROOT_DOTENV_PATH) -> bool:
+    return bool(load_dotenv(dotenv_path))
+
+
+load_service_env()
 
 
 class Settings:

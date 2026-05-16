@@ -17,6 +17,7 @@ const services: ServiceProxy[] = [
   { name: "sender-worker", port: 8087 },
   { name: "notification-error-service", port: 8088 },
   { name: "ops-gateway", port: 8090, ws: true },
+  { name: "template-generator", port: 8091 },
   { name: "stats-service", port: 8092 },
 ];
 

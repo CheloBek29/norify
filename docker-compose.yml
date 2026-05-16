@@ -140,6 +140,7 @@ services:
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       CAMPAIGN_SERVICE_URL: http://campaign-service:8080
+      DISPATCHER_WORKERS: 4
     ports:
       - "8086:8080"
     depends_on:
@@ -155,9 +156,9 @@ services:
       POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       REDIS_URL: redis://redis:6379/0
-      WORKER_PREFETCH: 1
+      WORKER_PREFETCH: 20
       WORKER_MIN_POOL: 1
-      WORKER_MAX_POOL: 1
+      WORKER_MAX_POOL: 20
       WORKER_SCALE_INTERVAL_SECONDS: 5
       WORKER_SCALE_MAX_DEPTH: 200
       CHANNEL_STUB_MIN_DELAY_SECONDS: 1

@@ -540,6 +540,20 @@ export async function fetchErrorGroups(campaignId: string): Promise<ErrorGroup[]
   return payload.map(normalizeErrorGroup);
 }
 
+export async function sendCampaignAction(campaignId: string, action: "start" | "stop" | "retry" | "switch_channel" | "cancel_campaign" | "archive"): Promise<Campaign> {
+  const pathByAction = {
+    start: "start",
+    stop: "stop",
+    retry: "retry-failed",
+    switch_channel: "switch-channel",
+    cancel_campaign: "cancel",
+    archive: "archive",
+  } as const;
+  const response = await fetch(`${api.campaigns}/campaigns/${campaignId}/${pathByAction[action]}`, { method: "POST" });
+  if (!response.ok) throw new Error("campaign_action_failed");
+  return normalizeCampaign(await response.json());
+}
+
 export async function fetchTemplates(): Promise<Template[]> {
   const response = await fetch(`${api.templates}/templates`);
   if (!response.ok) throw new Error("templates_unavailable");

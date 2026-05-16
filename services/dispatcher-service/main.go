@@ -28,25 +28,39 @@ type dispatchRequest struct {
 }
 
 var (
-	mq   *amqp.Channel
-	mqMu sync.Mutex
+	mq      *amqp.Channel
+	mqMu    sync.Mutex
+	mqReady int
+)
+
+const (
+	freshSendPriority      uint8 = 5
+	automaticRetryPriority uint8 = 1
 )
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	go appruntime.RunWithReconnect(ctx, "dispatcher-service", func(ctx context.Context, ch *amqp.Channel) error {
-		mqMu.Lock()
-		mq = ch
-		mqMu.Unlock()
-		defer func() {
+	for i := 0; i < dispatcherWorkerCount(); i++ {
+		workerName := fmt.Sprintf("dispatcher-service-%d", i)
+		go appruntime.RunWithReconnect(ctx, workerName, func(ctx context.Context, ch *amqp.Channel) error {
 			mqMu.Lock()
-			mq = nil
+			mq = ch
+			mqReady++
 			mqMu.Unlock()
-		}()
-		return consumeCampaignDispatch(ctx, ch)
-	})
+			defer func() {
+				mqMu.Lock()
+				mqReady--
+				if mqReady <= 0 {
+					mqReady = 0
+					mq = nil
+				}
+				mqMu.Unlock()
+			}()
+			return consumeCampaignDispatch(ctx, ch, workerName)
+		})
+	}
 
 	mux := httpapi.NewMux(httpapi.Service{
 		Name:    "dispatcher-service",
@@ -54,11 +68,27 @@ func main() {
 		Ready: func() bool {
 			mqMu.Lock()
 			defer mqMu.Unlock()
-			return mq != nil
+			return mqReady > 0
 		},
 	})
 	mux.HandleFunc("/dispatch/preview", previewDispatch)
 	_ = httpapi.Listen("dispatcher-service", mux)
+}
+
+func dispatcherWorkerCount() int {
+	workers := appruntime.EnvInt("DISPATCHER_WORKERS", 4)
+	if workers < 1 {
+		return 1
+	}
+	return workers
+}
+
+func dispatchMaxSendQueueDepth() int {
+	depth := appruntime.EnvInt("DISPATCH_MAX_SEND_QUEUE_DEPTH", 5000)
+	if depth < 1 {
+		return 1
+	}
+	return depth
 }
 
 func previewDispatch(w http.ResponseWriter, r *http.Request) {
@@ -70,11 +100,11 @@ func previewDispatch(w http.ResponseWriter, r *http.Request) {
 	httpapi.WriteJSON(w, http.StatusOK, campaigns.BuildDispatchBatches(req.UserIDs, req.Channels, req.BatchSize))
 }
 
-func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel) error {
+func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel, consumerTag string) error {
 	if err := channel.Qos(1, 0, false); err != nil {
 		return fmt.Errorf("qos: %w", err)
 	}
-	deliveries, err := channel.Consume(appruntime.QueueCampaignDispatch, "dispatcher-service", false, false, false, false, nil)
+	deliveries, err := channel.Consume(appruntime.QueueCampaignDispatch, consumerTag, false, false, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("consume: %w", err)
 	}
@@ -94,24 +124,18 @@ func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel) error {
 			_ = delivery.Nack(false, false)
 			continue
 		}
+		if req.CampaignID == "" {
+			_ = delivery.Nack(false, false)
+			continue
+		}
 		start := time.Now()
-		active, err := campaignDispatchActive(context.Background(), req.CampaignID)
-		if err != nil {
-			slog.Warn("check campaign dispatch status", "campaign_id", req.CampaignID, "error", err)
-			_ = delivery.Nack(false, true)
-			continue
-		}
-		if !active {
-			_ = delivery.Ack(false)
-			continue
-		}
-		maxQueueDepth := appruntime.EnvInt("DISPATCH_MAX_SEND_QUEUE_DEPTH", 300)
+		maxQueueDepth := dispatchMaxSendQueueDepth()
 		if throttled, err := dispatchBackpressure(channel, maxQueueDepth); err != nil {
 			slog.Warn("inspect send queue", "error", err)
 		} else if throttled {
 			delay := time.Duration(appruntime.EnvInt("DISPATCH_CONTINUATION_DELAY_MS", 250)) * time.Millisecond
 			time.Sleep(delay)
-			if err := appruntime.PublishJSON(context.Background(), channel, "", appruntime.QueueCampaignDispatch, req); err != nil {
+			if err := publishDispatchWakeup(context.Background(), channel, req.CampaignID); err != nil {
 				slog.Error("requeue throttled campaign dispatch", "campaign_id", req.CampaignID, "error", err)
 				_ = delivery.Nack(false, true)
 				continue
@@ -119,30 +143,38 @@ func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel) error {
 			_ = delivery.Ack(false)
 			continue
 		}
-		maxMessages := appruntime.EnvInt("DISPATCH_MAX_MESSAGES_PER_TICK", 90)
-		window := dispatchRecipientWindow(req, maxMessages)
-		samples, err := dispatch(context.Background(), channel, req, window)
+		claim, ok, err := claimCampaignDispatch(context.Background(), req.CampaignID)
+		if err != nil {
+			slog.Error("claim campaign dispatch", "campaign_id", req.CampaignID, "error", err)
+			_ = delivery.Nack(false, true)
+			continue
+		}
+		if !ok {
+			_ = delivery.Ack(false)
+			continue
+		}
+		dispatchReq := dispatchRequestFromClaim(claim)
+		window := recipientWindow{Start: claim.LeaseStart, End: claim.LeaseEnd}
+		samples, err := dispatch(context.Background(), channel, dispatchReq, window, claimSendPriority(claim))
 		if err != nil {
 			slog.Error("dispatch campaign", "campaign_id", req.CampaignID, "error", err)
 			_ = delivery.Nack(false, true)
 			continue
 		}
 		p95 := campaigns.DispatchP95Milliseconds(samples)
-		if err := reportDispatchMetrics(context.Background(), req, p95, len(samples), time.Since(start)); err != nil {
-			slog.Warn("report dispatch metrics", "campaign_id", req.CampaignID, "error", err)
+		hasMore, err := completeCampaignDispatch(context.Background(), claim, p95, len(samples), time.Since(start))
+		if err != nil {
+			slog.Error("complete campaign dispatch", "campaign_id", req.CampaignID, "error", err)
+			_ = delivery.Nack(false, true)
+			continue
 		}
-		if window.NextStart > 0 {
-			req.StartRecipient = window.NextStart
-			delay := time.Duration(appruntime.EnvInt("DISPATCH_CONTINUATION_DELAY_MS", 250)) * time.Millisecond
-			time.Sleep(delay)
-			if err := appruntime.PublishJSON(context.Background(), channel, "", appruntime.QueueCampaignDispatch, req); err != nil {
+		if hasMore {
+			if err := publishDispatchWakeup(context.Background(), channel, req.CampaignID); err != nil {
 				slog.Error("requeue campaign dispatch continuation", "campaign_id", req.CampaignID, "error", err)
-				_ = delivery.Nack(false, true)
-				continue
 			}
 		}
 		_ = delivery.Ack(false)
-		slog.Info("campaign dispatch tick", "campaign_id", req.CampaignID, "recipients", window.End-window.Start+1, "next_start", window.NextStart, "duration_ms", time.Since(start).Milliseconds(), "p95_dispatch_ms", p95)
+		slog.Info("campaign dispatch tick", "campaign_id", req.CampaignID, "recipients", window.End-window.Start+1, "has_more", hasMore, "duration_ms", time.Since(start).Milliseconds(), "p95_dispatch_ms", p95)
 	}
 }
 
@@ -174,6 +206,91 @@ func campaignDispatchActive(ctx context.Context, campaignID string) (bool, error
 
 func canDispatchCampaignStatus(status string) bool {
 	return status == campaigns.StatusRunning || status == campaigns.StatusRetrying
+}
+
+func claimCampaignDispatch(ctx context.Context, campaignID string) (contracts.CampaignDispatchClaim, bool, error) {
+	baseURL := appruntime.Env("CAMPAIGN_SERVICE_URL", "http://campaign-service:8080")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/campaigns/"+campaignID+"/dispatch/claim", nil)
+	if err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNoContent {
+		return contracts.CampaignDispatchClaim{}, false, nil
+	}
+	if response.StatusCode >= 300 {
+		return contracts.CampaignDispatchClaim{}, false, errors.New(response.Status)
+	}
+	var claim contracts.CampaignDispatchClaim
+	if err := json.NewDecoder(response.Body).Decode(&claim); err != nil {
+		return contracts.CampaignDispatchClaim{}, false, err
+	}
+	return claim, true, nil
+}
+
+func completeCampaignDispatch(ctx context.Context, claim contracts.CampaignDispatchClaim, p95, batchCount int, duration time.Duration) (bool, error) {
+	payload := contracts.CampaignDispatchComplete{
+		CampaignID:    claim.CampaignID,
+		LeaseStart:    claim.LeaseStart,
+		LeaseEnd:      claim.LeaseEnd,
+		BatchCount:    batchCount,
+		DurationMs:    int(duration.Milliseconds()),
+		P95DispatchMs: p95,
+		ReportedAt:    time.Now().UTC(),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+	baseURL := appruntime.Env("CAMPAIGN_SERVICE_URL", "http://campaign-service:8080")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/campaigns/"+claim.CampaignID+"/dispatch/complete", bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		return false, errors.New(response.Status)
+	}
+	var result struct {
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	return result.HasMore, nil
+}
+
+func dispatchRequestFromClaim(claim contracts.CampaignDispatchClaim) contracts.CampaignDispatchRequest {
+	return contracts.CampaignDispatchRequest{
+		CampaignID:         claim.CampaignID,
+		TemplateID:         claim.TemplateID,
+		MessageBody:        claim.MessageBody,
+		TotalRecipients:    claim.TotalRecipients,
+		SelectedChannels:   claim.SelectedChannels,
+		SpecificRecipients: claim.SpecificRecipients,
+		BatchSize:          claim.BatchSize,
+		StartRecipient:     claim.LeaseStart,
+	}
+}
+
+func claimSendPriority(claim contracts.CampaignDispatchClaim) uint8 {
+	if claim.SendPriority > 0 {
+		return claim.SendPriority
+	}
+	return freshSendPriority
+}
+
+func publishDispatchWakeup(ctx context.Context, channel *amqp.Channel, campaignID string) error {
+	return appruntime.PublishJSON(ctx, channel, "", appruntime.QueueCampaignDispatch, contracts.CampaignDispatchWakeup{CampaignID: campaignID})
 }
 
 func dispatchBackpressure(channel *amqp.Channel, maxQueueDepth int) (bool, error) {
@@ -242,7 +359,7 @@ func dispatchWindowChannelCount(req contracts.CampaignDispatchRequest) int {
 	return count
 }
 
-func dispatch(ctx context.Context, channel *amqp.Channel, req contracts.CampaignDispatchRequest, window recipientWindow) ([]time.Duration, error) {
+func dispatch(ctx context.Context, channel *amqp.Channel, req contracts.CampaignDispatchRequest, window recipientWindow, priority uint8) ([]time.Duration, error) {
 	if req.BatchSize <= 0 {
 		req.BatchSize = campaigns.DefaultDispatchBatchSize
 	}
@@ -254,7 +371,7 @@ func dispatch(ctx context.Context, channel *amqp.Channel, req contracts.Campaign
 			end = window.End
 		}
 		for _, send := range buildSendMessages(req, recipientWindow{Start: start, End: end}) {
-			if err := appruntime.PublishJSON(ctx, channel, "", appruntime.QueueMessageSend, send); err != nil {
+			if err := appruntime.PublishJSONPriority(ctx, channel, "", appruntime.QueueMessageSend, priority, send); err != nil {
 				return samples, err
 			}
 		}

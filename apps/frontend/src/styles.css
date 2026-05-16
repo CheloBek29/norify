@@ -591,7 +591,7 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
 .errorGroupsPanel {
   align-self: stretch;
   grid-column: 1 / -1;
-  padding: 42px 52px 76px;
+  padding: 24px 28px 32px;
   background: #ffffff;
 }
 .errorGroupsPanel .panelHeader {
@@ -599,7 +599,7 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
 }
 .errorGroupsPanel h2 {
   color: #464646;
-  font-size: clamp(30px, 3vw, 38px);
+  font-size: clamp(22px, 2vw, 28px);
   font-weight: 600;
 }
 .queueMode {
@@ -619,43 +619,44 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
 .queueMode .icon { width: 15px; height: 15px; }
 .errorGroups {
   display: grid;
-  justify-items: center;
-  gap: 14px;
-  margin-top: 48px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 420px));
+  justify-content: center;
+  gap: 12px;
+  margin-top: 18px;
 }
 .errorGroupCard {
   display: grid;
-  width: min(100%, 572px);
-  gap: 16px;
+  width: 100%;
+  gap: 10px;
   border: 1px solid #d9b8b8;
   border-radius: 8px;
-  padding: 18px 42px 26px;
+  padding: 14px 16px 16px;
   background: #fff8fa;
   box-shadow:
     0 0 0 1px rgba(208, 0, 0, 0.04),
-    0 22px 52px rgba(214, 0, 0, 0.22),
-    0 0 58px rgba(244, 58, 58, 0.22);
+    0 12px 28px rgba(214, 0, 0, 0.12),
+    0 0 30px rgba(244, 58, 58, 0.14);
 }
 .groupHeader { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
 .groupHeader div { display: grid; gap: 4px; min-width: 0; }
 .groupHeader strong {
   color: #e00000;
-  font-size: clamp(30px, 3vw, 38px);
+  font-size: 24px;
   font-weight: 600;
   line-height: 1;
 }
 .groupHeader p {
   color: #343434;
-  font-size: 19px;
+  font-size: 15px;
   font-weight: 500;
   line-height: 1.2;
   overflow-wrap: anywhere;
 }
 .groupHeader b {
-  min-width: 76px;
+  min-width: 44px;
   text-align: right;
   color: #e00000;
-  font-size: 31px;
+  font-size: 24px;
   font-weight: 600;
   line-height: 1;
 }
@@ -674,27 +675,27 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
 .groupImpact {
   border: 1px solid #9aa3a7;
   border-radius: 4px;
-  padding: 6px 10px;
+  padding: 6px 9px;
   background: #ffffff;
   color: #667075;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1.25;
 }
 .groupActions {
   display: grid;
-  grid-template-columns: 132px minmax(150px, 1fr) 134px;
-  gap: 38px;
+  grid-template-columns: 104px minmax(128px, 1fr) 104px;
+  gap: 10px;
   align-items: center;
 }
 .groupActions button {
   min-width: 0;
-  min-height: 36px;
+  min-height: 32px;
   white-space: nowrap;
   border-radius: 4px;
-  padding: 7px 16px;
+  padding: 6px 10px;
   color: #777;
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
   background: #ffffff;
   border-color: #bfc6ca;
@@ -715,12 +716,12 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
   min-width: 0;
 }
 .switchChannelAction select {
-  min-height: 36px;
-  padding: 7px 36px 7px 16px;
+  min-height: 32px;
+  padding: 6px 30px 6px 12px;
   border-radius: 4px;
   border-color: transparent;
   color: #666;
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
   text-align: center;
   background-color: #ffffff;
@@ -1264,9 +1265,9 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
   .transportControls button, .recoveryActions button { flex: 1 1 160px; }
   .templateVariableGrid, .templateMetaGrid { grid-template-columns: 1fr; }
   .saveTemplateButton { width: 100%; }
-  .errorGroupsPanel { padding: 28px 18px 42px; }
-  .errorGroups { margin-top: 24px; }
-  .errorGroupCard { padding: 18px; }
+  .errorGroupsPanel { padding: 22px 18px 28px; }
+  .errorGroups { grid-template-columns: 1fr; margin-top: 16px; }
+  .errorGroupCard { padding: 14px; }
   .groupActions { grid-template-columns: 1fr; }
   .groupActions button { width: 100%; }
   .workerStatsGrid { grid-template-columns: 1fr; }

@@ -84,6 +84,60 @@ func TestCanStartCampaign(t *testing.T) {
 	}
 }
 
+func TestDispatchRecoveryCooldownDefaultsToLeaseLength(t *testing.T) {
+	t.Setenv("DISPATCH_RECOVERY_STALE_SECONDS", "")
+
+	if got := dispatchRecoveryCooldownSeconds(); got != 30 {
+		t.Fatalf("dispatchRecoveryCooldownSeconds() = %d, want 30", got)
+	}
+}
+
+func TestDispatchRecoveryCooldownClampsInvalidValues(t *testing.T) {
+	t.Setenv("DISPATCH_RECOVERY_STALE_SECONDS", "0")
+
+	if got := dispatchRecoveryCooldownSeconds(); got != 1 {
+		t.Fatalf("dispatchRecoveryCooldownSeconds() = %d, want 1", got)
+	}
+}
+
+func TestDispatchSendPriorityBoostsZeroProgressCampaigns(t *testing.T) {
+	if got := dispatchSendPriority(0); got != 9 {
+		t.Fatalf("zero-progress priority = %d, want 9", got)
+	}
+	if got := dispatchSendPriority(1); got != 5 {
+		t.Fatalf("active campaign priority = %d, want 5", got)
+	}
+}
+
+func TestDispatchRecipientWindowFairQuantum(t *testing.T) {
+	window := dispatchRecipientWindow(contracts.CampaignDispatchRequest{
+		TotalRecipients:  100,
+		SelectedChannels: []string{"email", "sms", "max"},
+		StartRecipient:   31,
+	}, 90)
+
+	if window.Start != 31 || window.End != 60 || window.NextStart != 61 {
+		t.Fatalf("window = %#v, want 31..60 next 61", window)
+	}
+}
+
+func TestDispatchRecipientWindowUsesSpecificRecipientChannels(t *testing.T) {
+	window := dispatchRecipientWindow(contracts.CampaignDispatchRequest{
+		TotalRecipients:  999,
+		SelectedChannels: []string{"email"},
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "u1", Channels: []string{"email"}},
+			{UserID: "u2", Channels: []string{"email", "max"}},
+			{UserID: "u3", Channels: []string{"max"}},
+		},
+		StartRecipient: 1,
+	}, 4)
+
+	if window.Start != 1 || window.End != 2 || window.NextStart != 3 {
+		t.Fatalf("specific window = %#v, want 1..2 next 3", window)
+	}
+}
+
 func TestPrepareSpecificRecipientsOwnsAudienceCounts(t *testing.T) {
 	recipients, totalRecipients, totalMessages := prepareSpecificRecipients(createCampaignRequest{
 		SelectedChannels: []string{"email", "sms", "telegram"},
