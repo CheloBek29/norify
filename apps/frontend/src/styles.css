@@ -484,6 +484,7 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
 .splitRow div { height: 10px; background: #e6edf3; border-radius: 999px; overflow: hidden; }
 .splitRow i { display: block; height: 100%; background: var(--accent-strong); border-radius: inherit; }
 .splitRow strong { text-align: right; }
+.channelTotalFraction { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 .errorGroupsPanel { align-self: stretch; }
 .queueMode {
@@ -791,6 +792,208 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
 .event small { color: var(--muted); text-align: right; }
 .event-warn { background: #fffaf0; border-color: #ecd19b; }
 .event-error { background: #fff1ef; border-color: #efc1ba; }
+
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 20, 40, 0.48);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 20px;
+}
+.modalBox {
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 0;
+  max-height: 90vh;
+  overflow: hidden;
+}
+.modalHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.modalFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+}
+.iconButton {
+  background: transparent;
+  border: none;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  cursor: pointer;
+}
+.iconButton:hover { color: var(--text); }
+.userPickerModal { width: min(720px, 96vw); grid-template-rows: auto auto 1fr auto; }
+.modalSearch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.modalSearch input { flex: 1; }
+.userPickerTable { display: grid; grid-template-rows: auto 1fr; overflow: hidden; }
+.userPickerHead {
+  display: grid;
+  grid-template-columns: 30px minmax(130px, 1.3fr) minmax(140px, 1fr) 80px 90px;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 20px;
+  background: #f5f8fb;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.userPickerBody {
+  overflow-y: auto;
+  max-height: 360px;
+}
+.userPickerRow {
+  display: grid;
+  grid-template-columns: 30px minmax(130px, 1.3fr) minmax(140px, 1fr) 80px 90px;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 20px;
+  border-bottom: 1px solid var(--border);
+  transition: background 120ms;
+  cursor: pointer;
+}
+.userPickerRow:hover { background: var(--accent-faint); }
+.userPickerRow.picked { background: color-mix(in srgb, var(--accent-faint) 70%, #fff); }
+.userPickerRow > span { display: grid; gap: 2px; min-width: 0; overflow: hidden; }
+.userPickerRow > span > strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.userPickerRow > span > span { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.userPickerRow > span > small { color: var(--muted); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.userTags { display: flex; flex-wrap: nowrap; gap: 3px; align-items: center; overflow: hidden; }
+.userTags small {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent-strong);
+  background: var(--accent-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.chDropBtn {
+  min-height: 28px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #f1f4f8;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 120ms;
+  width: 100%;
+  text-align: left;
+}
+.chDropBtn:hover:not(.dim) { border-color: var(--accent-strong); background: var(--accent-faint); }
+.chDropBtn.open { border-color: var(--accent-strong); background: var(--accent-faint); }
+.chDropBtn.dim { opacity: 0.35; cursor: default; background: transparent; border-color: transparent; }
+.chDropMenu {
+  min-width: 180px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+  padding: 6px 0;
+  display: grid;
+}
+.chDropItem {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 100ms;
+}
+.chDropItem:hover { background: var(--accent-faint); }
+.chDropItem.active { color: var(--accent-strong); }
+.chDropItem input { width: 15px; height: 15px; accent-color: var(--accent-strong); flex-shrink: 0; }
+.pickerBulkBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fafcff;
+}
+.pickerChannelHint { color: var(--muted); font-size: 12px; margin-left: auto; }
+.pickerPager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 20px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.pickerPager .buttonRow { margin-top: 0; }
+.pickerPager > span { color: var(--muted); font-size: 13px; }
+.pickerPageLabel { display: flex; align-items: center; color: var(--text); font-size: 13px; }
+.pickerPageInput {
+  width: 52px;
+  text-align: center;
+  padding: 3px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  -moz-appearance: textfield;
+}
+.pickerPageInput::-webkit-outer-spin-button,
+.pickerPageInput::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.pickerPageInput:focus { outline: none; border-color: var(--accent-strong); }
+.specificUsersChip {
+  border: 1px solid var(--accent-strong);
+  border-radius: 8px;
+  padding: 13px;
+  background: var(--accent-faint);
+  display: grid;
+  gap: 6px;
+}
+.specificUsersChip > span { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--accent-strong); }
+.deliveriesControls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+.deliveriesControls input { flex: 1; min-width: 180px; }
+.deliveriesControls select { min-width: 120px; }
+.deliveriesPager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.deliveriesPager span { color: var(--muted); font-size: 13px; }
+.deliveriesPager .buttonRow { margin-top: 0; }
 
 @media (max-width: 1120px) {
   .createLayout, .twoColumn, .pageGrid, .heroPanel, .opsGrid, .templatesLayout { grid-template-columns: 1fr; }

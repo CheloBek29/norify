@@ -59,11 +59,14 @@ const navigation: { id: Screen; label: string; icon: IconName; adminOnly?: boole
 
 type Session = { email: string; role: Role } | null;
 
+type SpecificUser = { userId: string; channels: string[] };
+
 type WizardState = {
   name: string;
   templateId: string;
   filter: AudienceFilter;
   selectedChannels: string[];
+  specificUsers?: SpecificUser[];
 };
 
 export function App() {
@@ -519,9 +522,6 @@ export function App() {
           </div>
           <div className="topbarActions">
             <span className="apiState">{apiState}</span>
-            <select value={selectedCampaign && !selectedCampaign.archivedAt ? selectedCampaign.id : ""} onChange={(event) => setSelectedCampaignId(event.target.value)} disabled={activeCampaigns.length === 0}>
-              {activeCampaigns.map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
-            </select>
             <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
@@ -540,7 +540,7 @@ export function App() {
         {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} />}
         {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
-        {screen === "deliveries" && selectedCampaign && <Deliveries deliveries={deliveries.filter((delivery) => delivery.campaignId === selectedCampaign.id)} />}
+        {screen === "deliveries" && <Deliveries deliveries={deliveries} campaigns={campaigns} />}
         {screen === "stats" && <Stats campaigns={campaigns} channels={channels} />}
         {screen === "managers" && <Managers role={userSession.role} managers={managers} onAdd={addManager} />}
         {screen === "health" && <Health events={events} checks={healthChecks} onRefresh={refreshHealthViaWebSocket} />}
@@ -779,14 +779,19 @@ function Dashboard({
       <section className="panel">
         <div className="panelHeader"><h2>Линии отправки</h2><span>{campaign.selectedChannels.length} активны</span></div>
         <div className="splitGrid compact">
-          {campaign.selectedChannels.map((channel, index) => (
-            <div key={channel} className="splitRow">
-              <span>{channel}</span>
-              <div><i style={{ width: `${Math.max(18, 88 - index * 9)}%` }} /></div>
-              <strong>{Math.round((campaign.success / Math.max(1, campaign.selectedChannels.length)) * (1 - index * 0.04)).toLocaleString()}</strong>
-            </div>
-          ))}
-          </div>
+          {campaign.selectedChannels.map((channel, index) => {
+            const channelTotal = Math.round(campaign.totalMessages / Math.max(1, campaign.selectedChannels.length));
+            const channelSent = Math.round((campaign.success / Math.max(1, campaign.selectedChannels.length)) * (1 - index * 0.04));
+            const fillPct = channelTotal > 0 ? Math.min(100, Math.round((channelSent / channelTotal) * 100)) : 0;
+            return (
+              <div key={channel} className="splitRow">
+                <span>{channel}</span>
+                <div><i style={{ width: `${fillPct}%` }} /></div>
+                <strong>{channelSent.toLocaleString()} <span className="channelTotalFraction">/ {channelTotal.toLocaleString()}</span></strong>
+              </div>
+            );
+          })}
+        </div>
       </section>
 
       <ErrorGroupsPanel
@@ -976,6 +981,253 @@ function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns
   );
 }
 
+const FIRST_NAMES = ["Алексей","Мария","Дмитрий","Анна","Иван","Елена","Сергей","Ольга","Андрей","Наталья","Михаил","Татьяна","Александр","Ирина","Николай","Юлия","Павел","Екатерина","Роман","Светлана"];
+const LAST_NAMES = ["Петров","Иванова","Сидоров","Козлова","Новиков","Морозова","Волков","Соколова","Лебедев","Попова","Захаров","Федорова","Васильев","Смирнова","Орлов","Кузнецова","Беляев","Николаева","Макаров","Семенова"];
+const CITIES = ["Moscow","Saint Petersburg","Kazan","Novosibirsk","Yekaterinburg","Samara","Omsk","Chelyabinsk","Rostov","Ufa"];
+const TAG_SETS: string[][] = [["vip"],["retail"],["vip","retail"],["b2b"],["vip","b2b"],[],["retail","promo"],[],["vip"],[],];
+
+const MOCK_USERS: { id: string; name: string; email: string; city: string; tags: string[] }[] = Array.from({ length: 50000 }, (_, i) => {
+  const num = String(i + 1).padStart(5, "0");
+  const fn = FIRST_NAMES[i % FIRST_NAMES.length];
+  const ln = LAST_NAMES[(i * 3) % LAST_NAMES.length];
+  return {
+    id: `user-${num}`,
+    name: `${fn} ${ln}`,
+    email: `${fn.toLowerCase()}${num}@example.com`,
+    city: CITIES[i % CITIES.length],
+    tags: TAG_SETS[i % TAG_SETS.length],
+  };
+});
+
+const PICKER_PAGE_SIZE = 50;
+
+function ChannelDropdown({ userId, channels, availableChannels, disabled, onToggle }: {
+  userId: string;
+  channels: Set<string>;
+  availableChannels: string[];
+  disabled: boolean;
+  onToggle: (userId: string, ch: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+
+  function handleOpen(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (disabled) return;
+    if (btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      setPos({ top: rect.bottom + 4, left: rect.left });
+    }
+    setOpen((v) => !v);
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    function handler(e: MouseEvent) {
+      if (!(e.target as Element).closest(".chDropMenu") && !(e.target as Element).closest(".chDropBtn")) setOpen(false);
+    }
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const label = disabled ? "—" : `${channels.size} / ${availableChannels.length}`;
+  return (
+    <>
+      <button ref={btnRef} className={`chDropBtn${disabled ? " dim" : ""}${open ? " open" : ""}`} onClick={handleOpen} title={disabled ? "" : [...channels].join(", ")}>
+        {label} {!disabled && "▾"}
+      </button>
+      {open && (
+        <div className="chDropMenu" style={{ position: "fixed", top: pos.top, left: pos.left, zIndex: 2000 }}>
+          {availableChannels.map((ch) => {
+            const active = channels.has(ch);
+            const canUncheck = channels.size > 1;
+            return (
+              <label key={ch} className={`chDropItem${active ? " active" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={active}
+                  disabled={active && !canUncheck}
+                  onChange={() => { onToggle(userId, ch); }}
+                />
+                {ch}
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
+function UserPickerModal({ availableChannels, initialSelection, onClose, onConfirm }: {
+  availableChannels: string[];
+  initialSelection: SpecificUser[];
+  onClose: () => void;
+  onConfirm: (users: SpecificUser[]) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageInput, setPageInput] = useState("1");
+  const [selection, setSelection] = useState<Map<string, Set<string>>>(() => {
+    const map = new Map<string, Set<string>>();
+    for (const u of initialSelection) map.set(u.userId, new Set(u.channels));
+    return map;
+  });
+
+  const filtered = search.trim()
+    ? MOCK_USERS.filter((u) => {
+        const q = search.trim().toLowerCase();
+        return u.id.includes(q) || u.name.toLowerCase().includes(q) || u.email.includes(q) || u.city.toLowerCase().includes(q) || u.tags.some((t) => t.includes(q));
+      })
+    : MOCK_USERS;
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PICKER_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pageUsers = filtered.slice((safePage - 1) * PICKER_PAGE_SIZE, safePage * PICKER_PAGE_SIZE);
+
+  useEffect(() => { setPageInput(String(safePage)); }, [safePage]);
+
+  function handleSearch(value: string) { setSearch(value); setPage(1); }
+
+  function commitPageInput() {
+    const n = parseInt(pageInput, 10);
+    if (!isNaN(n) && n >= 1 && n <= totalPages) setPage(n);
+    else setPageInput(String(safePage));
+  }
+
+  function toggleUser(userId: string) {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.set(userId, new Set(availableChannels));
+      return next;
+    });
+  }
+
+  function toggleUserChannel(userId: string, ch: string) {
+    setSelection((prev) => {
+      if (!prev.has(userId)) return prev;
+      const next = new Map(prev);
+      const chs = new Set(next.get(userId)!);
+      if (chs.has(ch)) { if (chs.size > 1) chs.delete(ch); }
+      else chs.add(ch);
+      next.set(userId, chs);
+      return next;
+    });
+  }
+
+  function selectAllFiltered() {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      for (const u of filtered) if (!next.has(u.id)) next.set(u.id, new Set(availableChannels));
+      return next;
+    });
+  }
+
+  function deselectAllFiltered() {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      for (const u of filtered) next.delete(u.id);
+      return next;
+    });
+  }
+
+  const pageAllSelected = pageUsers.length > 0 && pageUsers.every((u) => selection.has(u.id));
+  const filteredSelectedCount = filtered.filter((u) => selection.has(u.id)).length;
+  const allFilteredSelected = filteredSelectedCount === filtered.length && filtered.length > 0;
+
+  function confirm() {
+    onConfirm([...selection.entries()].map(([userId, chs]) => ({ userId, channels: [...chs] })));
+  }
+
+  return (
+    <div className="modalOverlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="modalBox userPickerModal">
+        <div className="modalHeader">
+          <h2>Выбор пользователей</h2>
+          <span className="muted">{selection.size.toLocaleString()} выбрано из {MOCK_USERS.length.toLocaleString()}</span>
+          <button className="iconButton" onClick={onClose}><Icon name="cancel" /></button>
+        </div>
+        <div className="modalSearch">
+          <input value={search} onChange={(e) => handleSearch(e.target.value)} placeholder="Поиск по ID, имени, email, городу, тегу…" autoFocus />
+          <span className="muted">{filtered.length.toLocaleString()} найдено</span>
+        </div>
+        <div className="pickerBulkBar">
+          <button className="softButton" onClick={allFilteredSelected ? deselectAllFiltered : selectAllFiltered}>
+            {allFilteredSelected ? `Снять все ${filtered.length.toLocaleString()}` : `Выбрать все ${filtered.length.toLocaleString()}`}
+          </button>
+          {selection.size > 0 && <button onClick={() => setSelection(new Map())}>Сбросить выбор</button>}
+          <span className="pickerChannelHint">Каналы по умолчанию: {availableChannels.join(", ")}</span>
+        </div>
+        <div className="userPickerTable">
+          <div className="userPickerHead">
+            <input type="checkbox" checked={pageAllSelected} onChange={() => {
+              if (pageAllSelected) setSelection((prev) => { const next = new Map(prev); pageUsers.forEach((u) => next.delete(u.id)); return next; });
+              else setSelection((prev) => { const next = new Map(prev); pageUsers.forEach((u) => { if (!next.has(u.id)) next.set(u.id, new Set(availableChannels)); }); return next; });
+            }} title="Выбрать/снять страницу" />
+            <span>ID / Имя</span>
+            <span>Email · Город</span>
+            <span>Теги</span>
+            <span>Каналы</span>
+          </div>
+          <div className="userPickerBody">
+            {pageUsers.map((user) => {
+              const isSelected = selection.has(user.id);
+              const userChannels = selection.get(user.id) ?? new Set<string>();
+              return (
+                <div key={user.id} className={`userPickerRow${isSelected ? " picked" : ""}`} onClick={() => toggleUser(user.id)}>
+                  <input type="checkbox" checked={isSelected} onChange={() => toggleUser(user.id)} onClick={(e) => e.stopPropagation()} />
+                  <span><strong>{user.id}</strong><small>{user.name}</small></span>
+                  <span><span>{user.email}</span><small className="muted">{user.city}</small></span>
+                  <span className="userTags">{user.tags.length > 0 ? user.tags.map((t) => <small key={t}>{t}</small>) : <span className="muted">—</span>}</span>
+                  <span onClick={(e) => e.stopPropagation()}>
+                    <ChannelDropdown
+                      userId={user.id}
+                      channels={userChannels}
+                      availableChannels={availableChannels}
+                      disabled={!isSelected}
+                      onToggle={toggleUserChannel}
+                    />
+                  </span>
+                </div>
+              );
+            })}
+            {pageUsers.length === 0 && <div className="emptyState"><strong>Никто не найден</strong></div>}
+          </div>
+        </div>
+        <div className="pickerPager">
+          <div className="buttonRow tight">
+            <button disabled={safePage <= 1} onClick={() => setPage(1)}>«</button>
+            <button disabled={safePage <= 1} onClick={() => setPage((p) => p - 1)}>‹</button>
+            <span className="pickerPageLabel">
+              Стр.&nbsp;
+              <input
+                className="pickerPageInput"
+                type="number"
+                min={1}
+                max={totalPages}
+                value={pageInput}
+                onChange={(e) => setPageInput(e.target.value)}
+                onBlur={commitPageInput}
+                onKeyDown={(e) => { if (e.key === "Enter") { commitPageInput(); (e.target as HTMLInputElement).blur(); } }}
+              />
+              &nbsp;/ {totalPages.toLocaleString()}
+            </span>
+            <button disabled={safePage >= totalPages} onClick={() => setPage((p) => p + 1)}>›</button>
+            <button disabled={safePage >= totalPages} onClick={() => setPage(totalPages)}>»</button>
+          </div>
+          <span className="muted">{((safePage - 1) * PICKER_PAGE_SIZE + 1).toLocaleString()}–{Math.min(safePage * PICKER_PAGE_SIZE, filtered.length).toLocaleString()} из {filtered.length.toLocaleString()}</span>
+        </div>
+        <div className="modalFooter">
+          <button onClick={onClose}>Отмена</button>
+          <button className="primary" disabled={selection.size === 0} onClick={confirm}><Icon name="play" /> Применить ({selection.size.toLocaleString()})</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CreateCampaign({ templates, channels, onCreate }: { templates: Template[]; channels: Channel[]; onCreate: (wizard: WizardState) => void | Promise<void> }) {
   const enabledChannels = channels.filter((channel) => channel.enabled);
   const [wizard, setWizard] = useState<WizardState>({
@@ -984,8 +1236,13 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
     filter: defaultFilter,
     selectedChannels: enabledChannels.slice(0, 3).map((channel) => channel.code),
   });
-  const preview = audiencePreview(wizard.filter);
-  const totalMessages = preview * wizard.selectedChannels.length;
+  const [showPicker, setShowPicker] = useState(false);
+
+  const isSpecific = (wizard.specificUsers?.length ?? 0) > 0;
+  const preview = isSpecific ? (wizard.specificUsers?.length ?? 0) : audiencePreview(wizard.filter);
+  const totalMessages = isSpecific
+    ? (wizard.specificUsers ?? []).reduce((sum, u) => sum + u.channels.length, 0)
+    : preview * wizard.selectedChannels.length;
   const canStart = wizard.name.trim().length > 2 && wizard.templateId && wizard.selectedChannels.length > 0;
 
   function toggleChannel(code: string) {
@@ -997,55 +1254,84 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
     }));
   }
 
+  function applySpecificUsers(users: SpecificUser[]) {
+    setWizard((current) => ({ ...current, specificUsers: users.length > 0 ? users : undefined }));
+    setShowPicker(false);
+  }
+
   return (
-    <div className="createLayout">
-      <section className="panel formPanel">
-        <div className="panelHeader"><h2>Кампания</h2><Icon name="campaign" /></div>
-        <div className="formStack">
-          <label>Название<input value={wizard.name} onChange={(event) => setWizard({ ...wizard, name: event.target.value })} /></label>
-          <label>Шаблон
-            <select value={wizard.templateId} onChange={(event) => setWizard({ ...wizard, templateId: event.target.value })}>
-              {templates.map((template) => <option key={template.id} value={template.id}>{template.name} · v{template.version}</option>)}
-            </select>
-          </label>
-          <div className="templatePreview">{templates.find((template) => template.id === wizard.templateId)?.body}</div>
-        </div>
-      </section>
-
-      <section className="panel formPanel">
-        <div className="panelHeader"><h2>Аудитория</h2><strong>{preview.toLocaleString()}</strong></div>
-        <div className="formStack">
-          <div className="fieldGrid">
-            <label>Возраст от<input type="number" value={wizard.filter.minAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, minAge: Number(event.target.value) } })} /></label>
-            <label>Возраст до<input type="number" value={wizard.filter.maxAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, maxAge: Number(event.target.value) } })} /></label>
+    <>
+      {showPicker && (
+        <UserPickerModal
+          availableChannels={enabledChannels.map((c) => c.code).filter((c) => wizard.selectedChannels.includes(c))}
+          initialSelection={wizard.specificUsers ?? []}
+          onClose={() => setShowPicker(false)}
+          onConfirm={applySpecificUsers}
+        />
+      )}
+      <div className="createLayout">
+        <section className="panel formPanel">
+          <div className="panelHeader"><h2>Кампания</h2><Icon name="campaign" /></div>
+          <div className="formStack">
+            <label>Название<input value={wizard.name} onChange={(event) => setWizard({ ...wizard, name: event.target.value })} /></label>
+            <label>Шаблон
+              <select value={wizard.templateId} onChange={(event) => setWizard({ ...wizard, templateId: event.target.value })}>
+                {templates.map((template) => <option key={template.id} value={template.id}>{template.name} · v{template.version}</option>)}
+              </select>
+            </label>
+            <div className="templatePreview">{templates.find((template) => template.id === wizard.templateId)?.body}</div>
           </div>
-          <label>Пол
-            <select value={wizard.filter.gender} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, gender: event.target.value as AudienceFilter["gender"] } })}>
-              <option value="any">любой</option><option value="female">женский</option><option value="male">мужской</option>
-            </select>
-          </label>
-          <label>Город
-            <select value={wizard.filter.location} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, location: event.target.value } })}>
-              <option value="all">все</option><option value="Moscow">Москва</option><option value="Kazan">Казань</option><option value="Saint Petersburg">Санкт-Петербург</option>
-            </select>
-          </label>
-          <label>Теги<input value={wizard.filter.tags.join(", ")} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, tags: event.target.value.split(",").map((tag) => tag.trim()).filter(Boolean) } })} /></label>
-        </div>
-      </section>
+        </section>
 
-      <section className="panel formPanel">
-        <div className="panelHeader"><h2>Каналы</h2><strong>{totalMessages.toLocaleString()}</strong></div>
-        <div className="choiceList">
-          {enabledChannels.map((channel) => (
-            <button key={channel.code} className={wizard.selectedChannels.includes(channel.code) ? "choice selected" : "choice"} onClick={() => toggleChannel(channel.code)}>
-              <span><Icon name="channel" /> {channel.name}</span>
-              <small>{Math.round(channel.successProbability * 100)}%</small>
-            </button>
-          ))}
-        </div>
-        <div className="formActions"><button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> Запустить кампанию</button></div>
-      </section>
-    </div>
+        <section className="panel formPanel">
+          <div className="panelHeader"><h2>Аудитория</h2><strong>{preview.toLocaleString()}</strong></div>
+          {isSpecific ? (
+            <div className="specificUsersChip">
+              <span><Icon name="users" /> {wizard.specificUsers!.length.toLocaleString()} пользователей точечно</span>
+              <small className="muted">{totalMessages.toLocaleString()} сообщений · каналы могут различаться</small>
+              <div className="buttonRow tight">
+                <button onClick={() => setShowPicker(true)}>Изменить</button>
+                <button className="danger" onClick={() => setWizard((c) => ({ ...c, specificUsers: undefined }))}>Сбросить</button>
+              </div>
+            </div>
+          ) : (
+            <div className="formStack">
+              <div className="fieldGrid">
+                <label>Возраст от<input type="number" value={wizard.filter.minAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, minAge: Number(event.target.value) } })} /></label>
+                <label>Возраст до<input type="number" value={wizard.filter.maxAge} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, maxAge: Number(event.target.value) } })} /></label>
+              </div>
+              <label>Пол
+                <select value={wizard.filter.gender} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, gender: event.target.value as AudienceFilter["gender"] } })}>
+                  <option value="any">любой</option><option value="female">женский</option><option value="male">мужской</option>
+                </select>
+              </label>
+              <label>Город
+                <select value={wizard.filter.location} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, location: event.target.value } })}>
+                  <option value="all">все</option><option value="Moscow">Москва</option><option value="Kazan">Казань</option><option value="Saint Petersburg">Санкт-Петербург</option>
+                </select>
+              </label>
+              <label>Теги<input value={wizard.filter.tags.join(", ")} onChange={(event) => setWizard({ ...wizard, filter: { ...wizard.filter, tags: event.target.value.split(",").map((tag) => tag.trim()).filter(Boolean) } })} /></label>
+            </div>
+          )}
+          <div className="formActions">
+            <button onClick={() => setShowPicker(true)}><Icon name="users" /> {isSpecific ? "Изменить выбор" : "Выбрать точечно"}</button>
+          </div>
+        </section>
+
+        <section className="panel formPanel">
+          <div className="panelHeader"><h2>Каналы</h2><strong>{totalMessages.toLocaleString()}</strong></div>
+          <div className="choiceList">
+            {enabledChannels.map((channel) => (
+              <button key={channel.code} className={wizard.selectedChannels.includes(channel.code) ? "choice selected" : "choice"} onClick={() => toggleChannel(channel.code)}>
+                <span><Icon name="channel" /> {channel.name}</span>
+                <small>{Math.round(channel.successProbability * 100)}%</small>
+              </button>
+            ))}
+          </div>
+          <div className="formActions"><button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> Запустить кампанию</button></div>
+        </section>
+      </div>
+    </>
   );
 }
 
@@ -1343,22 +1629,111 @@ function optionalNumber(value: unknown): number | null {
   return Number.isFinite(number) ? number : null;
 }
 
-function Deliveries({ deliveries }: { deliveries: Delivery[] }) {
+const PAGE_SIZE = 100;
+
+function Deliveries({ deliveries, campaigns }: { deliveries: Delivery[]; campaigns: Campaign[] }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [channelFilter, setChannelFilter] = useState("all");
+  const [campaignFilter, setCampaignFilter] = useState("all");
+  const [page, setPage] = useState(1);
+  const [pageInput, setPageInput] = useState("1");
+
+  const allChannels = [...new Set(deliveries.map((d) => d.channelCode))].sort();
+
+  const filtered = deliveries.filter((delivery) => {
+    if (campaignFilter !== "all" && delivery.campaignId !== campaignFilter) return false;
+    if (statusFilter !== "all" && delivery.status !== statusFilter) return false;
+    if (channelFilter !== "all" && delivery.channelCode !== channelFilter) return false;
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      return delivery.userId.toLowerCase().includes(q) || delivery.channelCode.toLowerCase().includes(q) || (delivery.errorMessage ?? "").toLowerCase().includes(q);
+    }
+    return true;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const visible = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  useEffect(() => { setPageInput(String(safePage)); }, [safePage]);
+
+  function reset() { setSearch(""); setStatusFilter("all"); setChannelFilter("all"); setCampaignFilter("all"); setPage(1); }
+  function commitPage() {
+    const n = parseInt(pageInput, 10);
+    if (!isNaN(n) && n >= 1 && n <= totalPages) setPage(n);
+    else setPageInput(String(safePage));
+  }
+  const hasFilter = search || statusFilter !== "all" || channelFilter !== "all" || campaignFilter !== "all";
+
   return (
     <section className="panel wide">
-      <div className="panelHeader"><h2>Результаты доставки</h2><span>{deliveries.length} строк</span></div>
+      <div className="panelHeader">
+        <h2>Результаты доставки</h2>
+        <span>{filtered.length.toLocaleString()} / {deliveries.length.toLocaleString()} записей</span>
+      </div>
+      <div className="deliveriesControls">
+        <input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} placeholder="Поиск по userId, каналу, ошибке…" />
+        <select value={campaignFilter} onChange={(e) => { setCampaignFilter(e.target.value); setPage(1); }}>
+          <option value="all">Все кампании</option>
+          {campaigns.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}>
+          <option value="all">Все статусы</option>
+          <option value="sent">sent</option>
+          <option value="failed">failed</option>
+          <option value="queued">queued</option>
+          <option value="cancelled">cancelled</option>
+        </select>
+        <select value={channelFilter} onChange={(e) => { setChannelFilter(e.target.value); setPage(1); }}>
+          <option value="all">Все каналы</option>
+          {allChannels.map((ch) => <option key={ch} value={ch}>{ch}</option>)}
+        </select>
+        {hasFilter && <button onClick={reset}>Сбросить</button>}
+      </div>
       <div className="tableWrap">
         <table>
           <thead><tr><th>Пользователь</th><th>Канал</th><th>Статус</th><th>Попытка</th><th>Ошибка</th><th>Завершено</th></tr></thead>
           <tbody>
-            {deliveries.map((delivery) => (
+            {visible.map((delivery) => (
               <tr key={delivery.id}>
-                <td>{delivery.userId}</td><td>{delivery.channelCode}</td><td><span className={`delivery delivery-${delivery.status}`}>{delivery.status}</span></td><td>{delivery.attempt}</td><td>{delivery.errorMessage ?? "—"}</td><td>{formatDate(delivery.finishedAt)}</td>
+                <td>{delivery.userId}</td>
+                <td>{delivery.channelCode}</td>
+                <td><span className={`delivery delivery-${delivery.status}`}>{delivery.status}</span></td>
+                <td>{delivery.attempt}</td>
+                <td>{delivery.errorMessage ?? "—"}</td>
+                <td>{formatDate(delivery.finishedAt)}</td>
               </tr>
             ))}
+            {visible.length === 0 && <tr><td colSpan={6}><div className="emptyState"><strong>Нет результатов</strong><span>Попробуйте изменить фильтры или поисковый запрос.</span></div></td></tr>}
           </tbody>
         </table>
       </div>
+      {totalPages > 1 && (
+        <div className="deliveriesPager">
+          <span>{filtered.length.toLocaleString()} записей</span>
+          <div className="buttonRow tight">
+            <button disabled={safePage <= 1} onClick={() => setPage(1)}>«</button>
+            <button disabled={safePage <= 1} onClick={() => setPage((p) => p - 1)}>‹</button>
+            <span className="pickerPageLabel">
+              Стр.&nbsp;
+              <input
+                className="pickerPageInput"
+                type="number"
+                min={1}
+                max={totalPages}
+                value={pageInput}
+                onChange={(e) => setPageInput(e.target.value)}
+                onBlur={commitPage}
+                onKeyDown={(e) => { if (e.key === "Enter") { commitPage(); (e.target as HTMLInputElement).blur(); } }}
+              />
+              &nbsp;/ {totalPages}
+            </span>
+            <button disabled={safePage >= totalPages} onClick={() => setPage((p) => p + 1)}>›</button>
+            <button disabled={safePage >= totalPages} onClick={() => setPage(totalPages)}>»</button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
