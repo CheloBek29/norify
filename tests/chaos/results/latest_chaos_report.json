@@ -1,0 +1,456 @@
+{
+  "timestamp": "2026-05-16T06:29:59.111790+00:00",
+  "git": {
+    "branch": "tests/chaos-duplicates-pack",
+    "commit": "335eab7"
+  },
+  "config": {
+    "campaign_url": "http://localhost:18085",
+    "dispatcher_url": "http://localhost:18086",
+    "sender_url": "http://localhost:18087",
+    "status_url": "http://localhost:18090",
+    "rabbitmq_mgmt_url": "http://localhost:25672",
+    "campaigns": 1,
+    "users": 5,
+    "channels": 2,
+    "timeout_seconds": 180,
+    "poll_interval_seconds": 2,
+    "stop_worker": false,
+    "restart_worker": false,
+    "restart_rabbitmq": true,
+    "parallel_starts": true,
+    "parallel_retries": true,
+    "force_failure": false,
+    "skip_unsafe_rabbitmq": false,
+    "compose_project_name": "norifychaos",
+    "compose_files": "docker-compose.yml,/private/tmp/norify-chaos-ports.override.yml",
+    "allow_container_control": true,
+    "postgres_dsn": "",
+    "report_json": "tests/chaos/results/latest_chaos_report.json",
+    "report_md": "docs/chaos_duplicate_test_report.md"
+  },
+  "services_readiness": {
+    "campaign-service": {
+      "url": "http://localhost:18085/health/ready",
+      "status_code": 200,
+      "ok": true,
+      "body": {
+        "service": "campaign-service",
+        "status": "ready"
+      }
+    },
+    "dispatcher-service": {
+      "url": "http://localhost:18086/health/ready",
+      "status_code": 200,
+      "ok": true,
+      "body": {
+        "service": "dispatcher-service",
+        "status": "ready"
+      }
+    },
+    "sender-worker": {
+      "url": "http://localhost:18087/health/ready",
+      "status_code": 200,
+      "ok": true,
+      "body": {
+        "service": "sender-worker",
+        "status": "ready"
+      }
+    },
+    "status-service": {
+      "url": "http://localhost:18090/health/ready",
+      "status_code": 200,
+      "ok": true,
+      "body": {
+        "status": "ready",
+        "service": "status-service"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "readiness",
+      "status": "pass"
+    },
+    {
+      "name": "n_campaign_happy_path",
+      "status": "pass",
+      "result": {
+        "status": "pass",
+        "campaigns": [
+          {
+            "campaign_id": "cmp-db0f3d1e7e3f171b",
+            "create_status": 201,
+            "start_status": 200,
+            "start_body": {
+              "id": "cmp-db0f3d1e7e3f171b",
+              "name": "chaos-happy-1778912999-1",
+              "template_id": "tpl-reactivation",
+              "template_name": "Реактивация клиента",
+              "status": "running",
+              "filters": {},
+              "selected_channels": [
+                "custom_app",
+                "email"
+              ],
+              "total_recipients": 5,
+              "total_messages": 10,
+              "sent_count": 0,
+              "success_count": 0,
+              "failed_count": 0,
+              "cancelled_count": 0,
+              "p95_dispatch_ms": 0,
+              "created_at": "2026-05-16T06:29:59.154999Z",
+              "started_at": "2026-05-16T06:29:59.157288Z",
+              "snapshot": {
+                "type": "campaign.progress",
+                "campaign_id": "cmp-db0f3d1e7e3f171b",
+                "status": "running",
+                "total_messages": 10,
+                "processed": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "progress_percent": 0,
+                "updated_at": "2026-05-16T06:29:59.157822628Z"
+              }
+            },
+            "timed_out": false,
+            "duration_seconds": 4.017,
+            "expected_deliveries": 10,
+            "sent_count": 10,
+            "success_count": 10,
+            "failed_count": 0,
+            "status": "finished",
+            "duplicates": {
+              "available": true,
+              "status_code": 200,
+              "total_delivery_rows": 10,
+              "unique_delivery_keys": 10,
+              "expected_delivery_keys": 10,
+              "duplicate_delivery_rows_count": 0,
+              "duplicate_success_count": 0,
+              "duplicate_keys": [],
+              "limitations": "HTTP endpoint is limited to latest 500 rows; large campaigns need DB inspection."
+            }
+          }
+        ],
+        "failures": [],
+        "expected_deliveries": 10,
+        "completed_deliveries": 10,
+        "duration_seconds": 4.023,
+        "throughput_deliveries_per_second": 2.4856
+      }
+    },
+    {
+      "name": "parallel_start_duplicate_test",
+      "status": "pass",
+      "result": {
+        "status": "pass",
+        "campaign_id": "cmp-c036cd51f3b28117",
+        "start_responses": [
+          {
+            "status_code": 409,
+            "body": {
+              "error": "campaign_not_startable"
+            }
+          },
+          {
+            "status_code": 200,
+            "body": {
+              "id": "cmp-c036cd51f3b28117",
+              "name": "chaos-parallel-start-1778913003",
+              "template_id": "tpl-reactivation",
+              "template_name": "Реактивация клиента",
+              "status": "running",
+              "filters": {},
+              "selected_channels": [
+                "custom_app",
+                "email"
+              ],
+              "total_recipients": 5,
+              "total_messages": 10,
+              "sent_count": 0,
+              "success_count": 0,
+              "failed_count": 0,
+              "cancelled_count": 0,
+              "p95_dispatch_ms": 0,
+              "created_at": "2026-05-16T06:30:03.178593Z",
+              "started_at": "2026-05-16T06:30:03.188708Z",
+              "snapshot": {
+                "type": "campaign.progress",
+                "campaign_id": "cmp-c036cd51f3b28117",
+                "status": "running",
+                "total_messages": 10,
+                "processed": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "progress_percent": 0,
+                "updated_at": "2026-05-16T06:30:03.18954763Z"
+              }
+            }
+          },
+          {
+            "status_code": 200,
+            "body": {
+              "id": "cmp-c036cd51f3b28117",
+              "name": "chaos-parallel-start-1778913003",
+              "template_id": "tpl-reactivation",
+              "template_name": "Реактивация клиента",
+              "status": "running",
+              "filters": {},
+              "selected_channels": [
+                "custom_app",
+                "email"
+              ],
+              "total_recipients": 5,
+              "total_messages": 10,
+              "sent_count": 0,
+              "success_count": 0,
+              "failed_count": 0,
+              "cancelled_count": 0,
+              "p95_dispatch_ms": 0,
+              "created_at": "2026-05-16T06:30:03.178593Z",
+              "started_at": "2026-05-16T06:30:03.188708Z",
+              "snapshot": {
+                "type": "campaign.progress",
+                "campaign_id": "cmp-c036cd51f3b28117",
+                "status": "running",
+                "total_messages": 10,
+                "processed": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "progress_percent": 0,
+                "updated_at": "2026-05-16T06:30:03.190013755Z"
+              }
+            }
+          },
+          {
+            "status_code": 409,
+            "body": {
+              "error": "campaign_not_startable"
+            }
+          },
+          {
+            "status_code": 200,
+            "body": {
+              "id": "cmp-c036cd51f3b28117",
+              "name": "chaos-parallel-start-1778913003",
+              "template_id": "tpl-reactivation",
+              "template_name": "Реактивация клиента",
+              "status": "running",
+              "filters": {},
+              "selected_channels": [
+                "custom_app",
+                "email"
+              ],
+              "total_recipients": 5,
+              "total_messages": 10,
+              "sent_count": 0,
+              "success_count": 0,
+              "failed_count": 0,
+              "cancelled_count": 0,
+              "p95_dispatch_ms": 0,
+              "created_at": "2026-05-16T06:30:03.178593Z",
+              "started_at": "2026-05-16T06:30:03.188708Z",
+              "snapshot": {
+                "type": "campaign.progress",
+                "campaign_id": "cmp-c036cd51f3b28117",
+                "status": "running",
+                "total_messages": 10,
+                "processed": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "progress_percent": 0,
+                "updated_at": "2026-05-16T06:30:03.19013863Z"
+              }
+            }
+          }
+        ],
+        "final_campaign": {
+          "id": "cmp-c036cd51f3b28117",
+          "name": "chaos-parallel-start-1778913003",
+          "template_id": "tpl-reactivation",
+          "template_name": "Реактивация клиента",
+          "status": "finished",
+          "filters": {},
+          "selected_channels": [
+            "custom_app",
+            "email"
+          ],
+          "total_recipients": 5,
+          "total_messages": 10,
+          "sent_count": 10,
+          "success_count": 10,
+          "failed_count": 0,
+          "cancelled_count": 0,
+          "p95_dispatch_ms": 1,
+          "created_at": "2026-05-16T06:30:03.178593Z",
+          "started_at": "2026-05-16T06:30:03.188708Z",
+          "finished_at": "2026-05-16T06:30:05.889884Z",
+          "snapshot": {
+            "type": "campaign.progress",
+            "campaign_id": "cmp-c036cd51f3b28117",
+            "status": "finished",
+            "total_messages": 10,
+            "processed": 10,
+            "success": 10,
+            "failed": 0,
+            "cancelled": 0,
+            "progress_percent": 100,
+            "updated_at": "2026-05-16T06:30:07.20375234Z"
+          }
+        },
+        "expected_deliveries": 10,
+        "duplicates": {
+          "available": true,
+          "status_code": 200,
+          "total_delivery_rows": 10,
+          "unique_delivery_keys": 10,
+          "expected_delivery_keys": 10,
+          "duplicate_delivery_rows_count": 0,
+          "duplicate_success_count": 0,
+          "duplicate_keys": [],
+          "limitations": "HTTP endpoint is limited to latest 500 rows; large campaigns need DB inspection."
+        },
+        "timed_out": false,
+        "note": "Current main uses read-then-update start logic, so this scenario is expected to detect risk under real concurrency if duplicate dispatch occurs."
+      }
+    },
+    {
+      "name": "forced_failure_parallel_retry",
+      "status": "skipped",
+      "result": {
+        "status": "skipped",
+        "reason": "CHAOS_FORCE_FAILURE=false"
+      },
+      "reason": "CHAOS_FORCE_FAILURE=false"
+    },
+    {
+      "name": "worker_stop_start_fault",
+      "status": "skipped",
+      "result": {
+        "status": "skipped",
+        "reason": "container control disabled or worker fault flags false"
+      },
+      "reason": "container control disabled or worker fault flags false"
+    },
+    {
+      "name": "rabbitmq_restart_then_new_campaign",
+      "status": "fail",
+      "result": {
+        "status": "fail",
+        "mode": "idle_restart_then_new_campaign",
+        "campaign_id": "cmp-247eff2730051517",
+        "actions": [
+          {
+            "command": "docker compose restart rabbitmq",
+            "code": 0,
+            "output": "Container norifychaos-rabbitmq-1 Restarting \n Container norifychaos-rabbitmq-1 Started"
+          }
+        ],
+        "readiness_after": {
+          "campaign-service": {
+            "url": "http://localhost:18085/health/ready",
+            "status_code": 200,
+            "ok": true,
+            "body": {
+              "service": "campaign-service",
+              "status": "ready"
+            }
+          },
+          "dispatcher-service": {
+            "url": "http://localhost:18086/health/ready",
+            "status_code": 200,
+            "ok": true,
+            "body": {
+              "service": "dispatcher-service",
+              "status": "ready"
+            }
+          },
+          "sender-worker": {
+            "url": "http://localhost:18087/health/ready",
+            "status_code": 200,
+            "ok": true,
+            "body": {
+              "service": "sender-worker",
+              "status": "ready"
+            }
+          },
+          "status-service": {
+            "url": "http://localhost:18090/health/ready",
+            "status_code": 200,
+            "ok": true,
+            "body": {
+              "status": "ready",
+              "service": "status-service"
+            }
+          }
+        },
+        "readiness_failures": [],
+        "start_status": 502,
+        "start_body": "{\"error\":\"Exception (504) Reason: \\\"channel/connection is not open\\\"\"}\n",
+        "wait": {
+          "timed_out": true,
+          "campaign": {
+            "id": "cmp-247eff2730051517",
+            "name": "chaos-rabbitmq-after-restart-1778913028",
+            "template_id": "tpl-reactivation",
+            "template_name": "Реактивация клиента",
+            "status": "created",
+            "filters": {},
+            "selected_channels": [
+              "custom_app",
+              "email"
+            ],
+            "total_recipients": 5,
+            "total_messages": 10,
+            "sent_count": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "cancelled_count": 0,
+            "p95_dispatch_ms": 0,
+            "created_at": "2026-05-16T06:30:28.649511Z",
+            "snapshot": {
+              "type": "campaign.progress",
+              "campaign_id": "cmp-247eff2730051517",
+              "status": "created",
+              "total_messages": 10,
+              "processed": 0,
+              "success": 0,
+              "failed": 0,
+              "cancelled": 0,
+              "progress_percent": 0,
+              "updated_at": "2026-05-16T06:33:27.173076794Z"
+            }
+          },
+          "elapsed_seconds": 180.525
+        },
+        "duplicates": {
+          "available": true,
+          "status_code": 200,
+          "total_delivery_rows": 0,
+          "unique_delivery_keys": 0,
+          "expected_delivery_keys": 10,
+          "duplicate_delivery_rows_count": 0,
+          "duplicate_success_count": 0,
+          "duplicate_keys": [],
+          "limitations": "HTTP endpoint is limited to latest 500 rows; large campaigns need DB inspection."
+        }
+      },
+      "reason": ""
+    }
+  ],
+  "failed_http_calls": [],
+  "container_actions": [],
+  "limitations": [
+    "HTTP deliveries endpoint returns at most 500 rows, so large duplicate checks need DB inspection.",
+    "Current main has no deterministic force-failure API; forced retry scenario skips unless support is added.",
+    "Optional DB duplicate inspection is not implemented without an approved dependency.",
+    "Campaign start duplicate detection is black-box and depends on live queue/worker behavior."
+  ],
+  "overall_status": "fail"
+}
