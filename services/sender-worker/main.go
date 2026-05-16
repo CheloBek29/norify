@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/norify/platform/packages/contracts"
 	"github.com/norify/platform/packages/go-common/campaigns"
@@ -303,6 +304,14 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 	if !active {
 		return nil
 	}
+	sendable, reason, err := shouldSendDelivery(ctx, req)
+	if err != nil {
+		return err
+	}
+	if !sendable {
+		slog.Info("skip duplicate or stale delivery before provider send", "campaign_id", req.CampaignID, "idempotency_key", req.IdempotencyKey, "attempt", req.Attempt, "reason", reason)
+		return nil
+	}
 	config := channelConfig(ctx, req.ChannelCode)
 	registry := channels.NewRegistry([]channels.Config{config})
 	result := registry.Adapter(req.ChannelCode).Send(ctx, channels.Message{RecipientID: req.UserID, Body: req.MessageBody})
@@ -310,12 +319,12 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 	if result.Status == channels.StatusFailed {
 		status = "failed"
 	}
-	inserted, err := writeDelivery(ctx, req, status, result)
+	writeResult, err := writeDelivery(ctx, req, status, result)
 	if err != nil {
 		return err
 	}
-	if inserted {
-		if err := updateCampaignCounters(ctx, req.CampaignID, status); err != nil {
+	if writeResult.Applied {
+		if err := updateCampaignCounters(ctx, req.CampaignID, writeResult.PreviousStatus, status); err != nil {
 			return err
 		}
 	}
@@ -348,6 +357,38 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 // ---------------------------------------------------------------------------
 // DB helpers
 // ---------------------------------------------------------------------------
+
+func shouldSendDelivery(ctx context.Context, req contracts.SendMessageRequest) (bool, string, error) {
+	if db == nil || req.IdempotencyKey == "" {
+		return true, "no_db_state", nil
+	}
+	var previousStatus string
+	var previousAttempt int
+	err := db.QueryRow(ctx, `SELECT status, attempt FROM message_deliveries WHERE idempotency_key = $1`, req.IdempotencyKey).Scan(&previousStatus, &previousAttempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, "new_delivery", nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if canSendDelivery(previousStatus, previousAttempt, req.Attempt) {
+		return true, "sendable_state", nil
+	}
+	return false, "status=" + previousStatus, nil
+}
+
+func canSendDelivery(previousStatus string, previousAttempt, nextAttempt int) bool {
+	if previousStatus == "" {
+		return true
+	}
+	if previousStatus == "queued" {
+		return nextAttempt > previousAttempt
+	}
+	if previousStatus == "failed" {
+		return nextAttempt > previousAttempt
+	}
+	return false
+}
 
 func campaignProcessingActive(ctx context.Context, campaignID string) (bool, error) {
 	if db == nil || campaignID == "" {
@@ -393,7 +434,22 @@ func channelConfig(ctx context.Context, code string) channels.Config {
 	return config
 }
 
-func writeDelivery(ctx context.Context, req contracts.SendMessageRequest, status string, result channels.Result) (bool, error) {
+type deliveryWriteResult struct {
+	Applied        bool
+	PreviousStatus string
+}
+
+func writeDelivery(ctx context.Context, req contracts.SendMessageRequest, status string, result channels.Result) (deliveryWriteResult, error) {
+	var previousStatus string
+	var previousAttempt int
+	err := db.QueryRow(ctx, `SELECT status, attempt FROM message_deliveries WHERE idempotency_key = $1`, req.IdempotencyKey).Scan(&previousStatus, &previousAttempt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return deliveryWriteResult{}, err
+	}
+	if err == nil && !canApplyDeliveryResult(previousStatus, previousAttempt, req.Attempt) {
+		return deliveryWriteResult{PreviousStatus: previousStatus}, nil
+	}
+
 	tag, err := db.Exec(ctx, `
 		INSERT INTO message_deliveries (
 		  id, campaign_id, user_id, channel_code, message_body, status, error_code,
@@ -412,16 +468,41 @@ func writeDelivery(ctx context.Context, req contracts.SendMessageRequest, status
 		    sent_at = EXCLUDED.sent_at,
 		    finished_at = EXCLUDED.finished_at,
 		    updated_at = now()
-		WHERE message_deliveries.status = 'queued'`,
+		WHERE message_deliveries.status = 'queued'
+		   OR (message_deliveries.status = 'failed' AND EXCLUDED.attempt > message_deliveries.attempt)`,
 		newID("delivery"), req.CampaignID, req.UserID, req.ChannelCode, req.MessageBody, status, result.ErrorCode,
 		result.Error, req.Attempt, req.IdempotencyKey, result.FinishedAt)
 	if err != nil {
-		return false, err
+		return deliveryWriteResult{}, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return deliveryWriteResult{Applied: tag.RowsAffected() > 0, PreviousStatus: previousStatus}, nil
 }
 
-func updateCampaignCounters(ctx context.Context, campaignID, status string) error {
+func canApplyDeliveryResult(previousStatus string, previousAttempt, nextAttempt int) bool {
+	if previousStatus == "" || previousStatus == "queued" {
+		return true
+	}
+	if previousStatus == "failed" {
+		return nextAttempt > previousAttempt
+	}
+	return false
+}
+
+func updateCampaignCounters(ctx context.Context, campaignID, previousStatus, status string) error {
+	if previousStatus == "failed" {
+		if status != "sent" {
+			return nil
+		}
+		_, err := db.Exec(ctx, `
+			UPDATE campaigns
+			SET failed_count = GREATEST(failed_count - 1, 0),
+			    success_count = success_count + 1,
+			    status = CASE WHEN sent_count >= total_messages THEN $2 ELSE status END,
+			    finished_at = CASE WHEN sent_count >= total_messages THEN now() ELSE finished_at END,
+			    updated_at = now()
+			WHERE id = $1`, campaignID, campaigns.StatusFinished)
+		return err
+	}
 	if status == "sent" {
 		_, err := db.Exec(ctx, `
 			UPDATE campaigns

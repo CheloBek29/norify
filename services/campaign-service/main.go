@@ -6,9 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -60,28 +65,99 @@ type errorGroupActionRequest struct {
 }
 
 var db *pgxpool.Pool
-var mq *amqp.Channel
+
+var (
+	mq   *amqp.Channel
+	mqMu sync.RWMutex
+)
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	var err error
 	db, err = appruntime.OpenPostgres(ctx)
 	appruntime.LogStartup("campaign-service postgres", err)
 	if db != nil {
 		appruntime.LogStartup("campaign-service schema", ensureSchema(ctx))
 	}
-	if conn, channel, qErr := appruntime.OpenRabbit(); qErr == nil {
-		defer conn.Close()
-		defer channel.Close()
-		mq = channel
-	} else {
-		appruntime.LogStartup("campaign-service rabbitmq", qErr)
-	}
+	startCampaignPublisher(ctx)
 
-	mux := httpapi.NewMux(httpapi.Service{Name: "campaign-service", Version: "0.2.0", Ready: func() bool { return db != nil && mq != nil }})
+	mux := httpapi.NewMux(httpapi.Service{Name: "campaign-service", Version: "0.2.0", Ready: func() bool { return db != nil && publisherAvailable() }})
 	mux.HandleFunc("/campaigns", campaignsCollection)
 	mux.HandleFunc("/campaigns/", campaignAction)
 	_ = httpapi.Listen("campaign-service", mux)
+}
+
+func startCampaignPublisher(ctx context.Context) {
+	go appruntime.RunWithReconnect(ctx, "campaign-service-publisher", func(ctx context.Context, channel *amqp.Channel) error {
+		setPublisher(channel)
+		slog.Info("rabbitmq publisher connected", "service", "campaign-service")
+		defer clearPublisher(channel)
+
+		closed := channel.NotifyClose(make(chan *amqp.Error, 1))
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-closed:
+			if err == nil {
+				return errors.New("rabbitmq publisher channel closed")
+			}
+			return fmt.Errorf("rabbitmq publisher channel closed: %w", err)
+		}
+	})
+}
+
+func setPublisher(channel *amqp.Channel) {
+	mqMu.Lock()
+	defer mqMu.Unlock()
+	mq = channel
+}
+
+func clearPublisher(channel *amqp.Channel) {
+	mqMu.Lock()
+	defer mqMu.Unlock()
+	if mq == channel {
+		mq = nil
+	}
+}
+
+func currentPublisher() *amqp.Channel {
+	mqMu.RLock()
+	defer mqMu.RUnlock()
+	return mq
+}
+
+func publisherAvailable() bool {
+	return currentPublisher() != nil
+}
+
+func resetPublisher(channel *amqp.Channel) {
+	clearPublisher(channel)
+	_ = channel.Close()
+}
+
+func publishWithPublisher(ctx context.Context, operation string, publish func(*amqp.Channel) error) error {
+	channel := currentPublisher()
+	if channel == nil {
+		return errors.New("rabbitmq_unavailable")
+	}
+	if err := publish(channel); err != nil {
+		slog.Warn("rabbitmq publish failed; publisher will reconnect", "service", "campaign-service", "operation", operation, "error", err)
+		resetPublisher(channel)
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
+}
+
+func publishJSON(ctx context.Context, operation, exchange, routingKey string, payload any) error {
+	return publishJSONPriority(ctx, operation, exchange, routingKey, 0, payload)
+}
+
+func publishJSONPriority(ctx context.Context, operation, exchange, routingKey string, priority uint8, payload any) error {
+	return publishWithPublisher(ctx, operation, func(channel *amqp.Channel) error {
+		return appruntime.PublishJSONPriority(ctx, channel, exchange, routingKey, priority, payload)
+	})
 }
 
 func campaignsCollection(w http.ResponseWriter, r *http.Request) {
@@ -246,29 +322,80 @@ func dispatchMetrics(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func startCampaign(w http.ResponseWriter, r *http.Request, id string) {
-	campaign, err := getCampaign(r.Context(), id)
+	now := time.Now().UTC()
+	campaign, rollback, started, err := transitionCampaignToRunning(r.Context(), id, now)
 	if err != nil {
 		writeLookupError(w, err)
 		return
 	}
-	if !canStartCampaign(campaign.Status) {
+	if !started {
 		httpapi.WriteJSON(w, http.StatusConflict, map[string]string{"error": "campaign_not_startable"})
 		return
 	}
-	now := time.Now().UTC()
-	_, err = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = COALESCE(started_at, $3), updated_at = now() WHERE id = $1`, id, campaigns.StatusRunning, now)
-	if err != nil {
-		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
 	if err := publishDispatch(r.Context(), campaign); err != nil {
-		rollback := rollbackStateAfterStartFailure(campaign)
 		_, _ = db.Exec(r.Context(), `UPDATE campaigns SET status = $2, started_at = $3, updated_at = now() WHERE id = $1 AND status = $4`, id, rollback.Status, rollback.StartedAt, campaigns.StatusRunning)
 		httpapi.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
 	campaign, _ = getCampaign(r.Context(), id)
 	httpapi.WriteJSON(w, http.StatusOK, campaign)
+}
+
+func transitionCampaignToRunning(ctx context.Context, id string, startedAt time.Time) (Campaign, rollbackStartState, bool, error) {
+	row := db.QueryRow(ctx, `
+		WITH candidate AS (
+			SELECT id, status, started_at
+			FROM campaigns
+			WHERE id = $1
+			  AND status IN ($4, $5)
+			FOR UPDATE
+		),
+		updated AS (
+			UPDATE campaigns c
+			SET status = $2,
+			    started_at = COALESCE(c.started_at, $3),
+			    updated_at = now()
+			FROM candidate
+			WHERE c.id = candidate.id
+			RETURNING candidate.status AS previous_status, candidate.started_at AS previous_started_at,
+			          c.id, c.name, c.template_id, c.status, c.filters, c.selected_channels,
+			          c.total_recipients, c.total_messages, c.sent_count, c.success_count,
+			          c.failed_count, c.cancelled_count, c.p95_dispatch_ms, c.created_at,
+			          c.started_at, c.finished_at, c.archived_at
+		)
+		SELECT u.previous_status, u.previous_started_at,
+		       u.id, u.name, u.template_id, COALESCE(t.name, ''), u.status, u.filters, u.selected_channels,
+		       u.total_recipients, u.total_messages, u.sent_count, u.success_count, u.failed_count, u.cancelled_count,
+		       u.p95_dispatch_ms, u.created_at, u.started_at, u.finished_at, u.archived_at
+		FROM updated u
+		LEFT JOIN templates t ON t.id = u.template_id`,
+		id, campaigns.StatusRunning, startedAt, campaigns.StatusCreated, campaigns.StatusStopped)
+	var previous rollbackStartState
+	var campaign Campaign
+	var selected []byte
+	err := row.Scan(
+		&previous.Status, &previous.StartedAt,
+		&campaign.ID, &campaign.Name, &campaign.TemplateID, &campaign.TemplateName, &campaign.Status,
+		&campaign.Filters, &selected, &campaign.TotalRecipients, &campaign.TotalMessages,
+		&campaign.SentCount, &campaign.SuccessCount, &campaign.FailedCount, &campaign.CancelledCount,
+		&campaign.P95DispatchMs, &campaign.CreatedAt, &campaign.StartedAt, &campaign.FinishedAt, &campaign.ArchivedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, lookupErr := getCampaign(ctx, id); lookupErr != nil {
+			return Campaign{}, rollbackStartState{}, false, lookupErr
+		}
+		return Campaign{}, rollbackStartState{}, false, nil
+	}
+	if err != nil {
+		return Campaign{}, rollbackStartState{}, false, err
+	}
+	_ = json.Unmarshal(selected, &campaign.SelectedChannels)
+	progress := campaigns.Progress{
+		CampaignID: campaign.ID, TotalMessages: campaign.TotalMessages, Success: campaign.SuccessCount,
+		Failed: campaign.FailedCount, Cancelled: campaign.CancelledCount, IsCancelled: campaign.Status == campaigns.StatusCancelled,
+	}
+	campaign.Snapshot = progress.Snapshot()
+	return campaign, previous, true, nil
 }
 
 type rollbackStartState struct {
@@ -345,28 +472,21 @@ func archiveCampaign(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func retryFailed(w http.ResponseWriter, r *http.Request, id string) {
-	campaign, err := getCampaign(r.Context(), id)
-	if err != nil {
-		writeLookupError(w, err)
-		return
-	}
-	retryCount := campaign.FailedCount
-	if retryCount <= 0 {
-		httpapi.WriteJSON(w, http.StatusOK, campaign)
-		return
-	}
-	_, err = db.Exec(r.Context(), `
-		UPDATE campaigns
-		SET status = $2, total_messages = total_messages + failed_count, failed_count = 0, updated_at = now()
-		WHERE id = $1`, id, campaigns.StatusRetrying)
+	rows, err := claimFailedRowsForCampaign(r.Context(), id, 5000)
 	if err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	campaign.TotalRecipients = retryCount
-	campaign.TotalMessages = retryCount
-	campaign.FailedCount = 0
-	if err := publishDispatch(r.Context(), campaign); err != nil {
+	if len(rows) == 0 {
+		campaign, err := getCampaign(r.Context(), id)
+		if err != nil {
+			writeLookupError(w, err)
+			return
+		}
+		httpapi.WriteJSON(w, http.StatusOK, campaign)
+		return
+	}
+	if _, err := publishClaimedRetryRows(r.Context(), id, rows); err != nil {
 		httpapi.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
@@ -375,41 +495,10 @@ func retryFailed(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func switchChannel(w http.ResponseWriter, r *http.Request, id string) {
-	campaign, err := getCampaign(r.Context(), id)
-	if err != nil {
-		writeLookupError(w, err)
-		return
-	}
-	var req switchChannelRequest
-	_ = httpapi.ReadJSON(r, &req)
-	if req.To == "" {
-		req.To = "email"
-	}
-	next := make([]string, 0, len(campaign.SelectedChannels))
-	replaced := false
-	for _, channel := range campaign.SelectedChannels {
-		if channel == req.From || channel == "telegram" {
-			next = append(next, req.To)
-			replaced = true
-			continue
-		}
-		next = append(next, channel)
-	}
-	if !replaced {
-		next = append(next, req.To)
-	}
-	selected, _ := json.Marshal(unique(next))
-	_, err = db.Exec(r.Context(), `UPDATE campaigns SET selected_channels = $2, status = $3, failed_count = 0, updated_at = now() WHERE id = $1`, id, selected, campaigns.StatusRetrying)
-	if err != nil {
-		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	campaign, _ = getCampaign(r.Context(), id)
-	if err := publishDispatch(r.Context(), campaign); err != nil {
-		httpapi.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	httpapi.WriteJSON(w, http.StatusOK, campaign)
+	httpapi.WriteJSON(w, http.StatusConflict, map[string]string{
+		"error":   "campaign_switch_channel_disabled",
+		"message": "Смена канала для всей кампании отключена в демо: требуется точная маршрутизация по конкретным ошибочным доставкам.",
+	})
 }
 
 func stats(w http.ResponseWriter, r *http.Request, id string) {
@@ -543,40 +632,14 @@ func listErrorGroups(ctx context.Context, campaignID string) ([]contracts.ErrorG
 }
 
 func requeueErrorGroup(ctx context.Context, campaignID, groupID string) (int, error) {
-	if mq == nil {
-		return 0, errors.New("rabbitmq_unavailable")
-	}
-	rows, err := failedRowsForGroup(ctx, campaignID, groupID)
+	rows, err := claimFailedRowsForGroup(ctx, campaignID, groupID, 5000)
 	if err != nil {
 		return 0, err
 	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	keys := make([]string, 0, len(rows))
-	for _, row := range rows {
-		keys = append(keys, row.IdempotencyKey)
-		req := contracts.SendMessageRequest{
-			CampaignID: campaignID, UserID: row.UserID, ChannelCode: row.ChannelCode, MessageBody: row.MessageBody,
-			Attempt: row.Attempt + 1, IdempotencyKey: row.IdempotencyKey,
-		}
-		if err := appruntime.PublishJSONPriority(ctx, mq, "", appruntime.QueueMessageSend, 8, req); err != nil {
-			return 0, err
-		}
-	}
-	if err := markFailedRowsQueued(ctx, campaignID, keys); err != nil {
-		return 0, err
-	}
-	if err := publishGroupStatusEvents(ctx, campaignID, rows, "queued"); err != nil {
-		return 0, err
-	}
-	return len(rows), nil
+	return publishClaimedRetryRows(ctx, campaignID, rows)
 }
 
 func switchErrorGroup(ctx context.Context, campaignID, groupID, toChannel string) (int, error) {
-	if mq == nil {
-		return 0, errors.New("rabbitmq_unavailable")
-	}
 	rows, err := failedRowsForGroup(ctx, campaignID, groupID)
 	if err != nil {
 		return 0, err
@@ -596,7 +659,7 @@ func switchErrorGroup(ctx context.Context, campaignID, groupID, toChannel string
 			CampaignID: campaignID, UserID: row.UserID, ChannelCode: toChannel, MessageBody: row.MessageBody,
 			Attempt: 1, IdempotencyKey: campaigns.IdempotencyKey(campaignID, row.UserID, toChannel) + ":switch:" + row.ID,
 		}
-		if err := appruntime.PublishJSONPriority(ctx, mq, "", appruntime.QueueMessageSend, 9, req); err != nil {
+		if err := publishJSONPriority(ctx, "switch-error-group", "", appruntime.QueueMessageSend, 9, req); err != nil {
 			return 0, err
 		}
 	}
@@ -666,22 +729,125 @@ func failedRowsForGroup(ctx context.Context, campaignID, groupID string) ([]fail
 	return out, rows.Err()
 }
 
-func markFailedRowsQueued(ctx context.Context, campaignID string, keys []string) error {
+func claimFailedRowsForCampaign(ctx context.Context, campaignID string, limit int) ([]failedDeliveryRow, error) {
+	return claimFailedRows(ctx, campaignID, "", limit)
+}
+
+func claimFailedRowsForGroup(ctx context.Context, campaignID, groupID string, limit int) ([]failedDeliveryRow, error) {
+	return claimFailedRows(ctx, campaignID, groupID, limit)
+}
+
+func claimFailedRows(ctx context.Context, campaignID, groupID string, limit int) ([]failedDeliveryRow, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	groupFilter := ""
+	args := []any{campaignID, limit}
+	if groupID != "" {
+		groupFilter = "AND md5(channel_code || ':' || COALESCE(error_code, '') || ':' || COALESCE(error_message, '')) = $3"
+		args = append(args, groupID)
+	}
+	rows, err := tx.Query(ctx, `
+		WITH candidate AS (
+			SELECT id
+			FROM message_deliveries
+			WHERE campaign_id = $1
+			  AND status IN ('failed', 'error')
+			  `+groupFilter+`
+			ORDER BY finished_at ASC NULLS LAST, updated_at ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
+			UPDATE message_deliveries md
+			SET status = 'queued',
+			    updated_at = now()
+			FROM candidate
+			WHERE md.id = candidate.id
+			  AND md.status IN ('failed', 'error')
+			RETURNING md.id, md.user_id, md.channel_code, md.message_body, md.attempt, md.idempotency_key
+		)
+		SELECT id, user_id, channel_code, message_body, attempt, idempotency_key
+		FROM claimed`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []failedDeliveryRow{}
+	for rows.Next() {
+		var row failedDeliveryRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.ChannelCode, &row.MessageBody, &row.Attempt, &row.IdempotencyKey); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE campaigns
+			SET status = $2,
+			    sent_count = GREATEST(sent_count - $3, 0),
+			    failed_count = GREATEST(failed_count - $3, 0),
+			    finished_at = NULL,
+			    updated_at = now()
+			WHERE id = $1`, campaignID, campaigns.StatusRunning, len(out)); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func publishClaimedRetryRows(ctx context.Context, campaignID string, rows []failedDeliveryRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	keys := make([]string, 0, len(rows))
+	for _, row := range rows {
+		keys = append(keys, row.IdempotencyKey)
+	}
+	for _, row := range rows {
+		req := contracts.SendMessageRequest{
+			CampaignID: campaignID, UserID: row.UserID, ChannelCode: row.ChannelCode, MessageBody: row.MessageBody,
+			Attempt: row.Attempt + 1, IdempotencyKey: row.IdempotencyKey,
+		}
+		if err := publishJSONPriority(ctx, "retry-failed-delivery", "", appruntime.QueueMessageSend, 8, req); err != nil {
+			_ = restoreQueuedRowsFailed(ctx, campaignID, keys)
+			return 0, err
+		}
+	}
+	if err := publishGroupStatusEvents(ctx, campaignID, rows, "queued"); err != nil {
+		slog.Warn("publish retry status events failed", "campaign_id", campaignID, "error", err)
+	}
+	return len(rows), nil
+}
+
+func restoreQueuedRowsFailed(ctx context.Context, campaignID string, keys []string) error {
 	_, err := db.Exec(ctx, `
 		UPDATE message_deliveries
-		SET status = 'queued', error_code = NULL, error_message = NULL, updated_at = now()
-		WHERE campaign_id = $1 AND idempotency_key = ANY($2)`, campaignID, keys)
+		SET status = 'failed', updated_at = now()
+		WHERE campaign_id = $1 AND idempotency_key = ANY($2) AND status = 'queued'`, campaignID, keys)
 	if err != nil {
 		return err
 	}
 	_, err = db.Exec(ctx, `
 		UPDATE campaigns
-		SET status = $2,
-		    sent_count = GREATEST(sent_count - $3, 0),
-		    failed_count = GREATEST(failed_count - $3, 0),
-		    finished_at = NULL,
+		SET sent_count = sent_count + $2,
+		    failed_count = failed_count + $2,
+		    status = CASE WHEN sent_count + $2 >= total_messages THEN $3 ELSE status END,
+		    finished_at = CASE WHEN sent_count + $2 >= total_messages THEN now() ELSE finished_at END,
 		    updated_at = now()
-		WHERE id = $1`, campaignID, campaigns.StatusRunning, len(keys))
+		WHERE id = $1`, campaignID, len(keys), campaigns.StatusFinished)
 	return err
 }
 
@@ -732,7 +898,7 @@ func addSelectedChannel(ctx context.Context, campaignID, toChannel string) error
 }
 
 func publishGroupStatusEvents(ctx context.Context, campaignID string, rows []failedDeliveryRow, status string) error {
-	if mq == nil {
+	if !publisherAvailable() {
 		return nil
 	}
 	total := campaignTotalMessages(ctx, campaignID)
@@ -749,7 +915,7 @@ func publishGroupStatusEvents(ctx context.Context, campaignID string, rows []fai
 			IdempotencyKey: row.IdempotencyKey,
 			FinishedAt:     time.Now().UTC(),
 		}
-		if err := appruntime.PublishJSON(ctx, mq, appruntime.ExchangeMessageStatus, eventType, event); err != nil {
+		if err := publishJSON(ctx, "publish-group-status", appruntime.ExchangeMessageStatus, eventType, event); err != nil {
 			return err
 		}
 	}
@@ -757,7 +923,7 @@ func publishGroupStatusEvents(ctx context.Context, campaignID string, rows []fai
 }
 
 func publishCampaignProgress(ctx context.Context, campaign Campaign) error {
-	if mq == nil {
+	if !publisherAvailable() {
 		return nil
 	}
 	processed := campaign.SuccessCount + campaign.FailedCount + campaign.CancelledCount
@@ -781,7 +947,7 @@ func publishCampaignProgress(ctx context.Context, campaign Campaign) error {
 		ProgressPercent: progress,
 		UpdatedAt:       time.Now().UTC(),
 	}
-	return appruntime.PublishJSON(ctx, mq, appruntime.ExchangeCampaignStatus, "campaign.progress", event)
+	return publishJSON(ctx, "publish-campaign-progress", appruntime.ExchangeCampaignStatus, "campaign.progress", event)
 }
 
 func campaignTotalMessages(ctx context.Context, campaignID string) int {
@@ -791,9 +957,6 @@ func campaignTotalMessages(ctx context.Context, campaignID string) int {
 }
 
 func publishDispatch(ctx context.Context, campaign Campaign) error {
-	if mq == nil {
-		return errors.New("rabbitmq_unavailable")
-	}
 	body := ""
 	_ = db.QueryRow(ctx, `SELECT body FROM templates WHERE id = $1`, campaign.TemplateID).Scan(&body)
 	req := contracts.CampaignDispatchRequest{
@@ -805,7 +968,7 @@ func publishDispatch(ctx context.Context, campaign Campaign) error {
 		BatchSize:        appruntime.EnvInt("DISPATCH_BATCH_SIZE", campaigns.DefaultDispatchBatchSize),
 		RequestedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
-	return appruntime.PublishJSON(ctx, mq, "", appruntime.QueueCampaignDispatch, req)
+	return publishJSON(ctx, "publish-campaign-dispatch", "", appruntime.QueueCampaignDispatch, req)
 }
 
 func getCampaign(ctx context.Context, id string) (Campaign, error) {

@@ -87,6 +87,8 @@ export function App() {
   const [healthChecks, setHealthChecks] = useState<ServiceHealth[]>(initialHealthChecks);
   const [selectedCampaignId, setSelectedCampaignId] = useState(campaigns[0]?.id ?? "");
   const [apiState, setApiState] = useState("connecting");
+  const [pendingActionKeys, setPendingActionKeys] = useState<string[]>([]);
+  const [createPending, setCreatePending] = useState(false);
   const opsSocketRef = useRef<WebSocket | null>(null);
   const pendingOpsRef = useRef(new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>());
   const selectedCampaignIdRef = useRef(selectedCampaignId);
@@ -210,30 +212,7 @@ export function App() {
 
   useEffect(() => {
     if (apiState !== "local fallback") return;
-    const timer = window.setInterval(() => {
-      setCampaigns((items) =>
-        items.map((campaign) => {
-          if (campaign.status !== "running" && campaign.status !== "retrying") return campaign;
-          if (campaign.totalMessages <= 0) return campaign;
-          const remaining = campaign.totalMessages - campaign.processed;
-          if (remaining <= 0) return { ...campaign, status: "finished", finishedAt: new Date().toISOString() };
-          const step = Math.min(remaining, Math.max(260, Math.floor(campaign.totalMessages * 0.012)));
-          const failed = Math.round(step * (campaign.selectedChannels.includes("telegram") ? 0.068 : 0.028));
-          const success = step - failed;
-          const processed = campaign.processed + step;
-          return {
-            ...campaign,
-            status: processed >= campaign.totalMessages ? "finished" : campaign.status,
-            processed,
-            success: campaign.success + success,
-            failed: campaign.failed + failed,
-            p95DispatchMs: campaign.p95DispatchMs || 910,
-            finishedAt: processed >= campaign.totalMessages ? new Date().toISOString() : campaign.finishedAt,
-          };
-        }),
-      );
-    }, 1200);
-    return () => window.clearInterval(timer);
+    addEvent("warn", "frontend.local_fallback", "Backend недоступен: локальные демо-данные не являются доказательством доставки.", "frontend");
   }, [apiState, setCampaigns]);
 
   if (!session) {
@@ -266,6 +245,20 @@ export function App() {
         reject(new Error("websocket_timeout"));
       }, 8000);
     });
+  }
+
+  function isActionPending(key: string) {
+    return pendingActionKeys.includes(key);
+  }
+
+  async function runPendingAction(key: string, operation: () => Promise<void>) {
+    if (isActionPending(key)) return;
+    setPendingActionKeys((items) => [...items, key]);
+    try {
+      await operation();
+    } finally {
+      setPendingActionKeys((items) => items.filter((item) => item !== key));
+    }
   }
 
   function applyRealtimeMessage(message: Record<string, unknown>) {
@@ -325,32 +318,11 @@ export function App() {
   }
 
   async function createCampaign(wizard: WizardState) {
+    if (createPending) return;
+    setCreatePending(true);
     const template = templates.find((item) => item.id === wizard.templateId) ?? templates[0];
-    const totalRecipients = audiencePreview(wizard.filter);
+    const totalRecipients = wizard.specificUsers?.length ? wizard.specificUsers.length : audiencePreview(wizard.filter);
     const totalMessages = totalRecipients * wizard.selectedChannels.length;
-    const now = new Date().toISOString();
-    const optimisticCampaign: Campaign = {
-      id: id("cmp"),
-      name: wizard.name.trim() || "Новая кампания",
-      templateId: template.id,
-      templateName: template.name,
-      status: "running",
-      filters: wizard.filter,
-      selectedChannels: wizard.selectedChannels,
-      totalRecipients,
-      totalMessages,
-      processed: 0,
-      success: 0,
-      failed: 0,
-      cancelled: 0,
-      p95DispatchMs: 0,
-      createdAt: now,
-      startedAt: now,
-    };
-    setCampaigns((items) => [optimisticCampaign, ...items]);
-    setSelectedCampaignId(optimisticCampaign.id);
-    setScreen("dashboard");
-    addEvent("info", "campaign.started", `Campaign ${optimisticCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
 
     try {
       const result = await sendOpsCommand("campaign.create", {
@@ -361,17 +333,19 @@ export function App() {
         total_recipients: totalRecipients,
       });
       const backendCampaign = normalizeCampaign((result.campaign ?? result) as Record<string, unknown>);
-      setCampaigns((items) => [backendCampaign, ...items.filter((item) => item.id !== backendCampaign.id && item.id !== optimisticCampaign.id)]);
+      setCampaigns((items) => [backendCampaign, ...items.filter((item) => item.id !== backendCampaign.id)]);
       setSelectedCampaignId(backendCampaign.id);
+      setScreen("dashboard");
       setApiState("websocket commands");
+      addEvent("info", "campaign.started", `Campaign ${backendCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
       return;
-    } catch {
+    } catch (error) {
       setApiState("local fallback");
+      const message = error instanceof Error ? error.message : "backend_unavailable";
+      addEvent("error", "campaign.create_failed", `Campaign was not created in backend: ${message}`, "campaign-service");
+    } finally {
+      setCreatePending(false);
     }
-    const fallbackCampaign = { ...optimisticCampaign, p95DispatchMs: Math.min(1320, 720 + wizard.selectedChannels.length * 54) };
-    setCampaigns((items) => items.map((campaign) => campaign.id === optimisticCampaign.id ? fallbackCampaign : campaign));
-    setDeliveries((items) => [...createDeliveries(fallbackCampaign), ...items]);
-    setErrorGroups((items) => [...buildLocalErrorGroups(fallbackCampaign), ...items]);
   }
 
   function updateTemplate(template: Template) {
@@ -403,74 +377,56 @@ export function App() {
   async function handleCampaignAction(action: CampaignCommand, campaignId = selectedCampaign?.id) {
     const targetCampaign = campaigns.find((campaign) => campaign.id === campaignId);
     if (!targetCampaign) return;
-    void sendOpsCommand("campaign.action", { campaign_id: targetCampaign.id, action }).then((message) => {
-      if (message.campaign) {
-        const updated = normalizeCampaign(message.campaign as Record<string, unknown>);
-        setCampaigns((items) => items.map((campaign) => campaign.id === updated.id ? mergeCampaignUpdate(campaign, updated) : campaign));
+    const key = campaignActionKey(targetCampaign.id, action);
+    await runPendingAction(key, async () => {
+      try {
+        const message = await sendOpsCommand("campaign.action", { campaign_id: targetCampaign.id, action });
+        if (message.campaign) {
+          const updated = normalizeCampaign(message.campaign as Record<string, unknown>);
+          setCampaigns((items) => items.map((campaign) => campaign.id === updated.id ? mergeCampaignUpdate(campaign, updated) : campaign));
+          if (action === "archive" && selectedCampaign?.id === targetCampaign.id) {
+            const nextActive = campaigns.find((campaign) => campaign.id !== targetCampaign.id && !campaign.archivedAt);
+            if (nextActive) setSelectedCampaignId(nextActive.id);
+          }
+        }
+        if (action !== "start" && action !== "stop") {
+          setErrorGroups((items) => items.filter((group) => group.campaignId !== targetCampaign.id));
+        }
+        setApiState("websocket commands");
+        addEvent("info", `campaign.${action}`, `${targetCampaign.name}: backend confirmed ${action}`, "campaign-service");
+      } catch (error) {
+        setApiState("local fallback");
+        const message = error instanceof Error ? error.message : "command_failed";
+        addEvent("error", `campaign.${action}.failed`, `${targetCampaign.name}: backend did not apply ${action} (${message})`, "campaign-service");
       }
-      setApiState("websocket commands");
-    }).catch(() => setApiState("local fallback"));
-    setCampaigns((items) =>
-      items.map((campaign) => {
-        if (campaign.id !== targetCampaign.id) return campaign;
-        if (action === "start") return { ...campaign, status: "running", startedAt: new Date().toISOString() };
-        if (action === "stop") return { ...campaign, status: "stopped" };
-        if (action === "retry") {
-          const retryCount = campaign.failed;
-          return { ...campaign, status: "retrying", totalMessages: campaign.totalMessages + retryCount, failed: 0 };
-        }
-        if (action === "switch_channel") {
-          const selectedChannels = campaign.selectedChannels.includes("telegram")
-            ? campaign.selectedChannels.map((channel) => (channel === "telegram" ? "sms" : channel))
-            : [...new Set([...campaign.selectedChannels, "email"])];
-          return { ...campaign, status: "retrying", selectedChannels, totalMessages: campaign.totalRecipients * selectedChannels.length, failed: 0 };
-        }
-        if (action === "archive") return { ...campaign, archivedAt: new Date().toISOString() };
-        const cancelled = Math.max(0, campaign.totalMessages - campaign.processed);
-        return { ...campaign, status: "cancelled", cancelled, processed: campaign.totalMessages, finishedAt: new Date().toISOString() };
-      }),
-    );
-    if (action === "archive" && selectedCampaign?.id === targetCampaign.id) {
-      const nextActive = campaigns.find((campaign) => campaign.id !== targetCampaign.id && !campaign.archivedAt);
-      if (nextActive) setSelectedCampaignId(nextActive.id);
-    }
-    if (action !== "start" && action !== "stop") {
-      setErrorGroups((items) => items.filter((group) => group.campaignId !== targetCampaign.id));
-    }
-    addEvent("warn", `campaign.${action}`, `${targetCampaign.name}: ${action}`, "campaign-service");
+    });
   }
 
   async function handleErrorGroupAction(group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) {
     if (!selectedCampaign) return;
     const targetChannel = toChannel ?? channels.find((channel) => channel.enabled && channel.code !== group.channelCode)?.code ?? "";
-    void sendOpsCommand("error_group.action", {
-      campaign_id: selectedCampaign.id,
-      group_id: group.id,
-      action,
-      to_channel: targetChannel,
-    }).then((message) => {
-      if (message.campaign) {
-        const campaign = normalizeCampaign(message.campaign as Record<string, unknown>);
-        setCampaigns((items) => items.map((item) => item.id === campaign.id ? campaign : item));
+    const key = errorGroupActionKey(group.id, action);
+    await runPendingAction(key, async () => {
+      try {
+        const message = await sendOpsCommand("error_group.action", {
+          campaign_id: selectedCampaign.id,
+          group_id: group.id,
+          action,
+          to_channel: targetChannel,
+        });
+        if (message.campaign) {
+          const campaign = normalizeCampaign(message.campaign as Record<string, unknown>);
+          setCampaigns((items) => items.map((item) => item.id === campaign.id ? campaign : item));
+        }
+        setErrorGroups((items) => items.filter((item) => item.id !== group.id));
+        setApiState("websocket commands");
+        addEvent("info", `error_group.${action}`, `${group.channelCode}/${group.errorCode}: backend confirmed group action`, "campaign-service");
+      } catch (error) {
+        setApiState("local fallback");
+        const message = error instanceof Error ? error.message : "command_failed";
+        addEvent("error", `error_group.${action}.failed`, `${group.channelCode}/${group.errorCode}: backend did not apply action (${message})`, "campaign-service");
       }
-      setApiState("websocket commands");
-    }).catch(() => setApiState("local fallback"));
-    setErrorGroups((items) => items.filter((item) => item.id !== group.id));
-    setCampaigns((items) => items.map((campaign) => {
-      if (campaign.id !== selectedCampaign.id) return campaign;
-      const failed = Math.max(0, campaign.failed - group.failedCount);
-      const processed = action === "cancel_group" ? campaign.processed : Math.max(0, campaign.processed - group.failedCount);
-      const cancelled = action === "cancel_group" ? campaign.cancelled + group.failedCount : campaign.cancelled;
-      return {
-        ...campaign,
-        status: failed === 0 && processed >= campaign.totalMessages ? "finished" : "retrying",
-        processed,
-        failed,
-        cancelled,
-        selectedChannels: action === "switch_channel" && targetChannel ? [...new Set([...campaign.selectedChannels, targetChannel])] : campaign.selectedChannels,
-      };
-    }));
-    addEvent("warn", `error_group.${action}`, `${group.channelCode}/${group.errorCode}: группа обработана локально`, "campaign-service");
+    });
   }
 
   async function refreshHealthViaWebSocket() {
@@ -527,6 +483,11 @@ export function App() {
             <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
+        {apiState === "local fallback" && (
+          <div className="fallbackBanner" role="alert">
+            Backend недоступен. Локальные демо-данные не считаются реальной доставкой; новые кампании и повторные действия не применяются без подтверждения backend.
+          </div>
+        )}
 
         {screen === "dashboard" && selectedCampaign && (
           <Dashboard
@@ -536,10 +497,11 @@ export function App() {
             errorGroups={errorGroups.filter((group) => group.campaignId === selectedCampaign.id)}
             onAction={handleCampaignAction}
             onGroupAction={handleErrorGroupAction}
+            pendingActionKeys={pendingActionKeys}
           />
         )}
-        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} />}
-        {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} />}
+        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} pendingActionKeys={pendingActionKeys} />}
+        {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} pending={createPending} />}
         {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
         {screen === "deliveries" && <Deliveries deliveries={deliveries} campaigns={campaigns} />}
@@ -585,6 +547,14 @@ function snapshotLooksEmpty(snapshot: Record<string, unknown>, current: Campaign
     && Number(snapshot.success ?? 0) <= 0
     && Number(snapshot.failed ?? 0) <= 0
     && Number(snapshot.cancelled ?? 0) <= 0;
+}
+
+function campaignActionKey(campaignId: string, action: CampaignCommand) {
+  return `campaign:${campaignId}:${action}`;
+}
+
+function errorGroupActionKey(groupId: string, action: "retry" | "switch_channel" | "cancel_group") {
+  return `error-group:${groupId}:${action}`;
 }
 
 function Login({
@@ -729,6 +699,7 @@ function Dashboard({
   errorGroups,
   onAction,
   onGroupAction,
+  pendingActionKeys,
 }: {
   campaign: Campaign;
   channels: Channel[];
@@ -736,6 +707,7 @@ function Dashboard({
   errorGroups: ErrorGroup[];
   onAction: (action: CampaignCommand) => void;
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
+  pendingActionKeys: string[];
 }) {
   const percent = progressPercent(campaign);
   const totalMessages = effectiveTotalMessages(campaign);
@@ -751,11 +723,11 @@ function Dashboard({
           </div>
         </div>
         <div className="campaignControlBar">
-          <CampaignPlayerControls campaign={campaign} onAction={onAction} />
+          <CampaignPlayerControls campaign={campaign} onAction={onAction} pendingActionKeys={pendingActionKeys} />
           {campaign.failed > 0 && (
             <div className="recoveryActions" aria-label="Campaign recovery actions">
-              <button onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
-              <button onClick={() => onAction("switch_channel")}><Icon name="switch" /> Сменить канал</button>
+              <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
+              <span className="inlineNotice">Смена канала для всей кампании отключена в демо: используйте группы ошибок.</span>
             </div>
           )}
         </div>
@@ -803,26 +775,30 @@ function Dashboard({
         groups={errorGroups}
         onAction={onAction}
         onGroupAction={onGroupAction}
+        pendingActionKeys={pendingActionKeys}
       />
     </div>
   );
 }
 
-function CampaignPlayerControls({ campaign, onAction }: { campaign: Campaign; onAction: (action: CampaignCommand) => void }) {
+function CampaignPlayerControls({ campaign, onAction, pendingActionKeys }: { campaign: Campaign; onAction: (action: CampaignCommand) => void; pendingActionKeys: string[] }) {
   const isRunning = campaign.status === "running" || campaign.status === "retrying";
   const isComplete = campaign.status === "cancelled" || campaign.status === "finished";
   const canStart = campaign.status === "created" || campaign.status === "stopped";
   const startLabel = campaign.status === "stopped" ? "Продолжить" : "Запустить";
+  const startPending = pendingActionKeys.includes(campaignActionKey(campaign.id, "start"));
+  const stopPending = pendingActionKeys.includes(campaignActionKey(campaign.id, "stop"));
+  const cancelPending = pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"));
 
   return (
     <div className="transportControls" aria-label="Campaign player controls">
-      <button className="primary" disabled={!canStart} onClick={() => onAction("start")}>
+      <button className="primary" disabled={!canStart || startPending} onClick={() => onAction("start")}>
         <Icon name="play" /> {startLabel}
       </button>
-      <button disabled={!isRunning} onClick={() => onAction("stop")}>
+      <button disabled={!isRunning || stopPending} onClick={() => onAction("stop")}>
         <Icon name="stop" /> Остановить
       </button>
-      <button className="danger" disabled={isComplete} onClick={() => onAction("cancel_campaign")}>
+      <button className="danger" disabled={isComplete || cancelPending} onClick={() => onAction("cancel_campaign")}>
         <Icon name="cancel" /> Отменить
       </button>
     </div>
@@ -836,6 +812,7 @@ function ErrorGroupsPanel({
   groups,
   onAction,
   onGroupAction,
+  pendingActionKeys,
 }: {
   campaign: Campaign;
   channels: Channel[];
@@ -843,6 +820,7 @@ function ErrorGroupsPanel({
   groups: ErrorGroup[];
   onAction: (action: CampaignCommand) => void;
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
+  pendingActionKeys: string[];
 }) {
   return (
     <section className="panel errorGroupsPanel">
@@ -854,7 +832,7 @@ function ErrorGroupsPanel({
         <>
           <p className="muted">Основная кампания не прерывается; выбранные сообщения вставляются в текущую очередь с повышенным приоритетом.</p>
           <div className="errorGroups">
-            {groups.map((group) => <ErrorGroupCard key={group.id} group={group} channels={channels} onAction={onGroupAction} />)}
+            {groups.map((group) => <ErrorGroupCard key={group.id} group={group} channels={channels} onAction={onGroupAction} pendingActionKeys={pendingActionKeys} />)}
           </div>
         </>
       ) : (
@@ -863,9 +841,9 @@ function ErrorGroupsPanel({
           <span>Основная отправка продолжается. Новые сбои появятся здесь отдельными группами для точечного решения.</span>
           {campaign.failed > 0 && (
             <div className="buttonRow">
-              <button onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
-              <button onClick={() => onAction("switch_channel")}><Icon name="switch" /> {error.actions[1].label}</button>
-              <button className="danger" onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
+              <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
+              <span className="inlineNotice">Смена канала для всей кампании отключена в демо: требуется точная маршрутизация по конкретным ошибочным доставкам.</span>
+              <button className="danger" disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
             </div>
           )}
         </div>
@@ -878,10 +856,12 @@ function ErrorGroupCard({
   group,
   channels,
   onAction,
+  pendingActionKeys,
 }: {
   group: ErrorGroup;
   channels: Channel[];
   onAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
+  pendingActionKeys: string[];
 }) {
   const alternativeChannels = channels.filter((channel) => channel.enabled && channel.code !== group.channelCode);
   const [selectedChannel, setSelectedChannel] = useState(alternativeChannels[0]?.code ?? "");
@@ -916,14 +896,14 @@ function ErrorGroupCard({
                     {alternativeChannels.map((channel) => <option key={channel.code} value={channel.code}>{channel.name}</option>)}
                   </select>
                 </label>
-                <button disabled={!selectedChannel} onClick={() => onAction(group, code, selectedChannel)}>
+                <button disabled={!selectedChannel || pendingActionKeys.includes(errorGroupActionKey(group.id, code))} onClick={() => onAction(group, code, selectedChannel)}>
                   <Icon name="switch" /> Вставить
                 </button>
               </div>
             );
           }
           return (
-            <button key={code} className={code === "cancel_group" ? "danger" : ""} onClick={() => onAction(group, code)}>
+            <button key={code} className={code === "cancel_group" ? "danger" : ""} disabled={pendingActionKeys.includes(errorGroupActionKey(group.id, code))} onClick={() => onAction(group, code)}>
               <Icon name={code === "retry" ? "retry" : "stop"} /> {action.label}
             </button>
           );
@@ -933,7 +913,7 @@ function ErrorGroupCard({
   );
 }
 
-function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void }) {
+function CampaignList({ campaigns, selectedId, onSelect, onAction, pendingActionKeys }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void; pendingActionKeys: string[] }) {
   const [showArchive, setShowArchive] = useState(false);
   const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
   const archivedCampaigns = campaigns.filter((campaign) => campaign.archivedAt);
@@ -966,10 +946,10 @@ function CampaignList({ campaigns, selectedId, onSelect, onAction }: { campaigns
                 <td>{campaign.totalMessages.toLocaleString()}</td>
                 <td>{formatP95Dispatch(campaign)}</td>
                 <td className="tableActions">
-                  {!campaign.archivedAt && campaign.status === "created" && <button onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Старт</button>}
-                  {!campaign.archivedAt && campaign.failed > 0 && <button onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Повторить</button>}
-                  {!campaign.archivedAt && (campaign.status === "running" || campaign.status === "retrying") && <button className="danger" onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Отменить</button>}
-                  {!campaign.archivedAt && campaign.status !== "created" && <button onClick={() => onAction(campaign.id, "archive")}><Icon name="archive" /> В архив</button>}
+                  {!campaign.archivedAt && campaign.status === "created" && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "start"))} onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Старт</button>}
+                  {!campaign.archivedAt && campaign.failed > 0 && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Повторить</button>}
+                  {!campaign.archivedAt && (campaign.status === "running" || campaign.status === "retrying") && <button className="danger" disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Отменить</button>}
+                  {!campaign.archivedAt && campaign.status !== "created" && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "archive"))} onClick={() => onAction(campaign.id, "archive")}><Icon name="archive" /> В архив</button>}
                 </td>
               </tr>
             ))}
@@ -1033,7 +1013,7 @@ function ChannelDropdown({ userId, channels, availableChannels, disabled, onTogg
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
-  const label = disabled ? "—" : `${channels.size} / ${availableChannels.length}`;
+  const label = disabled ? (channels.size > 0 ? "общие" : "—") : `${channels.size} / ${availableChannels.length}`;
   return (
     <>
       <button ref={btnRef} className={`chDropBtn${disabled ? " dim" : ""}${open ? " open" : ""}`} onClick={handleOpen} title={disabled ? "" : [...channels].join(", ")}>
@@ -1188,7 +1168,7 @@ function UserPickerModal({ availableChannels, initialSelection, onClose, onConfi
                       userId={user.id}
                       channels={userChannels}
                       availableChannels={availableChannels}
-                      disabled={!isSelected}
+                      disabled
                       onToggle={toggleUserChannel}
                     />
                   </span>
@@ -1230,7 +1210,7 @@ function UserPickerModal({ availableChannels, initialSelection, onClose, onConfi
   );
 }
 
-function CreateCampaign({ templates, channels, onCreate }: { templates: Template[]; channels: Channel[]; onCreate: (wizard: WizardState) => void | Promise<void> }) {
+function CreateCampaign({ templates, channels, onCreate, pending }: { templates: Template[]; channels: Channel[]; onCreate: (wizard: WizardState) => void | Promise<void>; pending: boolean }) {
   const enabledChannels = channels.filter((channel) => channel.enabled);
   const [wizard, setWizard] = useState<WizardState>({
     name: "Новая кампания",
@@ -1243,9 +1223,9 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
   const isSpecific = (wizard.specificUsers?.length ?? 0) > 0;
   const preview = isSpecific ? (wizard.specificUsers?.length ?? 0) : audiencePreview(wizard.filter);
   const totalMessages = isSpecific
-    ? (wizard.specificUsers ?? []).reduce((sum, u) => sum + u.channels.length, 0)
+    ? preview * wizard.selectedChannels.length
     : preview * wizard.selectedChannels.length;
-  const canStart = wizard.name.trim().length > 2 && wizard.templateId && wizard.selectedChannels.length > 0;
+  const canStart = wizard.name.trim().length > 2 && Boolean(wizard.templateId) && wizard.selectedChannels.length > 0 && !pending;
 
   function toggleChannel(code: string) {
     setWizard((current) => ({
@@ -1257,7 +1237,12 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
   }
 
   function applySpecificUsers(users: SpecificUser[]) {
-    setWizard((current) => ({ ...current, specificUsers: users.length > 0 ? users : undefined }));
+    setWizard((current) => ({
+      ...current,
+      specificUsers: users.length > 0
+        ? users.map((user) => ({ ...user, channels: current.selectedChannels }))
+        : undefined,
+    }));
     setShowPicker(false);
   }
 
@@ -1289,8 +1274,8 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
           <div className="panelHeader"><h2>Аудитория</h2><strong>{preview.toLocaleString()}</strong></div>
           {isSpecific ? (
             <div className="specificUsersChip">
-              <span><Icon name="users" /> {wizard.specificUsers!.length.toLocaleString()} пользователей точечно</span>
-              <small className="muted">{totalMessages.toLocaleString()} сообщений · каналы могут различаться</small>
+              <span><Icon name="users" /> {wizard.specificUsers!.length.toLocaleString()} пользователей как демо-сэмпл</span>
+              <small className="muted">{totalMessages.toLocaleString()} сообщений · backend получит количество и общие каналы, не точные ID</small>
               <div className="buttonRow tight">
                 <button onClick={() => setShowPicker(true)}>Изменить</button>
                 <button className="danger" onClick={() => setWizard((c) => ({ ...c, specificUsers: undefined }))}>Сбросить</button>
@@ -1318,6 +1303,7 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
           <div className="formActions">
             <button onClick={() => setShowPicker(true)}><Icon name="users" /> {isSpecific ? "Изменить выбор" : "Выбрать точечно"}</button>
           </div>
+          <div className="demoNotice">Индивидуальный список сейчас используется только как честный demo sampling: backend dispatch не получает выбранные ID.</div>
         </section>
 
         <section className="panel formPanel">
@@ -1330,7 +1316,7 @@ function CreateCampaign({ templates, channels, onCreate }: { templates: Template
               </button>
             ))}
           </div>
-          <div className="formActions"><button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> Запустить кампанию</button></div>
+          <div className="formActions"><button className="primary startButton" disabled={!canStart} onClick={() => onCreate(wizard)}><Icon name="play" /> {pending ? "Запуск..." : "Запустить кампанию"}</button></div>
         </section>
       </div>
     </>

@@ -338,6 +338,17 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
   text-transform: uppercase;
 }
 
+.fallbackBanner {
+  margin: -10px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #f6c768;
+  border-radius: 8px;
+  color: #7c4b00;
+  background: #fff7e3;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
 .pageGrid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.85fr); gap: 18px; }
 .twoColumn { display: grid; grid-template-columns: minmax(320px, 0.85fr) minmax(0, 1.15fr); gap: 18px; }
 .createLayout { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 18px; align-items: start; }
@@ -378,6 +389,27 @@ input[type="range"] { min-height: 28px; padding: 0; accent-color: var(--accent-s
   gap: 10px;
   align-items: center;
   margin-top: 16px;
+}
+
+.demoNotice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #f0d49a;
+  border-radius: 8px;
+  color: #795300;
+  background: #fff9eb;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.inlineNotice {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  max-width: 360px;
+  color: #795300;
+  font-size: 12px;
+  line-height: 1.35;
 }
 .formActions .primary { min-width: 158px; }
 .formPanel label input,
