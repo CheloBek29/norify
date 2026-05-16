@@ -1058,7 +1058,7 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [taskDesc, setTaskDesc] = useState("");
+  const [taskDesc, setTaskDesc] = useState("Создай рассылку ");
   const [style, setStyle] = useState<AIStyle>("professional");
   const [generatedText, setGeneratedText] = useState("");
   const [editMode, setEditMode] = useState(false);
@@ -1075,7 +1075,14 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
       let line = raw
         .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
         .replace(/\*(.+?)\*/g, "<em>$1</em>")
-        .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+        .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>')
+        // {var} и {{var}} → красивый чип с подстановкой примера
+        .replace(/\{\{?([a-zA-Z_][a-zA-Z0-9_]*)\}?\}/g, (_, v) => {
+          const sample = templateSampleValues[v];
+          return sample
+            ? `<span class="aiVarChip" title="{{${v}}}">${sample}</span>`
+            : `<span class="aiVarChip unknown" title="{{${v}}}">${v}</span>`;
+        });
 
       // headings
       const hMatch = line.match(/^#{1,3}\s+(.+)/);
@@ -1188,7 +1195,11 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
           <div className="aiActions">
             <button onClick={() => { setStep(1); setGeneratedText(""); }}>← Назад</button>
             <button onClick={() => handleGenerateText()} disabled={loading}>{loading ? "Генерирую..." : "Перегенерировать"}</button>
-            <button className="primary" onClick={() => onApply(generatedText)}>Использовать текст →</button>
+            <button className="primary" onClick={() => {
+              // {var} → {{var}} для шаблонизатора
+              const converted = generatedText.replace(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g, "{{$1}}");
+              onApply(converted);
+            }}>Вставить в шаблон →</button>
           </div>
         </div>
       )}
@@ -1236,7 +1247,13 @@ function Templates({ templates, variableOptions, onSave }: { templates: Template
         <button className={activeTab === "library" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("library")}>Библиотека</button>
         <button className={activeTab === "ai" ? "tabBtn active" : "tabBtn"} onClick={() => setActiveTab("ai")}>AI Генератор</button>
       </div>
-      {activeTab === "ai" && <AIGenerator onApply={(text) => { setEditing({ ...createBlankTemplate(), body: text }); setActiveTab("library"); }} />}
+      {activeTab === "ai" && <AIGenerator onApply={(text) => {
+        const vars = [...new Set([...text.matchAll(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g)].map(m => m[1]))];
+        const tpl = { ...createBlankTemplate(), body: text, variables: vars };
+        setEditing(tpl);
+        onSave({ ...tpl, version: 1, updatedAt: new Date().toISOString() });
+        setActiveTab("library");
+      }} />}
       {activeTab === "library" && <div className="templatesLayout">
       <section className="panel formPanel templateLibraryPanel">
         <div className="panelHeader">
@@ -1317,7 +1334,13 @@ function Templates({ templates, variableOptions, onSave }: { templates: Template
           <span>{editing.body.length} символов</span>
         </div>
         <div className="messagePreview">
-          <div className="messageBubble">{preview || "..."}</div>
+          <div className="messageBubble">
+            {preview
+              ? preview.split("\n").filter(Boolean).map((line, i) => (
+                  <p key={i} style={{ margin: "0 0 6px" }}>{line}</p>
+                ))
+              : <p style={{ margin: 0, opacity: 0.5 }}>Введите текст...</p>}
+          </div>
         </div>
         <div className="templateMetaGrid">
           <Metric label="переменные" value={String(declaredVariables.length)} />
