@@ -1,27 +1,25 @@
 import logging
-import os
 from typing import Optional
 
 import aiohttp
 
+from config import settings
 from prompts import PROMPT_NEWSLETTER_TEMPLATE, STYLES, SYSTEM_PROMPT_BASE
 
 logger = logging.getLogger(__name__)
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
-async def _call_openai(system: str, user: str) -> str:
-    if not MISTRAL_API_KEY:
+async def _call_mistral(system: str, user: str) -> str:
+    if not settings.MISTRAL_API_KEY:
         return "Error: MISTRAL_API_KEY not set"
     headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Authorization": f"Bearer {settings.MISTRAL_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": MISTRAL_MODEL,
+        "model": settings.MISTRAL_MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -51,7 +49,7 @@ class TemplateGenerator:
             style_data["structure"],
         )
         logger.info("Generating newsletter text, style=%s", style)
-        text = await _call_openai(SYSTEM_PROMPT_BASE, user_prompt)
+        text = await _call_mistral(SYSTEM_PROMPT_BASE, user_prompt)
         if text.startswith("Error"):
             return {"success": False, "error": text}
         return {"success": True, "text": text.strip(), "style": style}
@@ -80,7 +78,7 @@ class TemplateGenerator:
 Верни ТОЛЬКО HTML код от <html> до </html> без бэктиков."""
 
         logger.info("Generating HTML template...")
-        html = await _call_openai(system, user_prompt)
+        html = await _call_mistral(system, user_prompt)
         if html.startswith("Error"):
             return {"success": False, "error": html}
 

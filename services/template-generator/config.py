@@ -2,8 +2,8 @@ import os
 
 
 class Settings:
-    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "mistral:7b")
+    MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
+    MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
     SERVICE_NAME: str = "template-generator"
     SERVICE_PORT: int = 8003
     SERVICE_HOST: str = "0.0.0.0"
