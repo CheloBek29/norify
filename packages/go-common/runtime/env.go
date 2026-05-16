@@ -70,31 +70,36 @@ func OpenPostgres(ctx context.Context) (*pgxpool.Pool, error) {
 	return nil, lastErr
 }
 
-func OpenRabbit() (*amqp.Connection, *amqp.Channel, error) {
+func openRabbitOnce() (*amqp.Connection, *amqp.Channel, error) {
 	url := Env("RABBITMQ_URL", "")
 	if url == "" {
 		return nil, nil, errors.New("RABBITMQ_URL is empty")
 	}
+	conn, err := amqp.Dial(url)
+	if err != nil {
+		return nil, nil, err
+	}
+	channel, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	if err := DeclareTopology(channel); err != nil {
+		_ = channel.Close()
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, channel, nil
+}
+
+func OpenRabbit() (*amqp.Connection, *amqp.Channel, error) {
 	var lastErr error
 	for attempt := 0; attempt < 30; attempt++ {
-		conn, err := amqp.Dial(url)
+		conn, ch, err := openRabbitOnce()
 		if err == nil {
-			channel, err := conn.Channel()
-			if err == nil {
-				if err := DeclareTopology(channel); err != nil {
-					_ = channel.Close()
-					_ = conn.Close()
-					lastErr = err
-				} else {
-					return conn, channel, nil
-				}
-			} else {
-				_ = conn.Close()
-				lastErr = err
-			}
-		} else {
-			lastErr = err
+			return conn, ch, nil
 		}
+		lastErr = err
 		time.Sleep(time.Second)
 	}
 	return nil, nil, lastErr

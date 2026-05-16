@@ -5,9 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os/signal"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/norify/platform/packages/contracts"
@@ -23,19 +27,36 @@ type dispatchRequest struct {
 	BatchSize int      `json:"batch_size"`
 }
 
-var mq *amqp.Channel
+var (
+	mq   *amqp.Channel
+	mqMu sync.Mutex
+)
 
 func main() {
-	if conn, channel, err := appruntime.OpenRabbit(); err == nil {
-		defer conn.Close()
-		defer channel.Close()
-		mq = channel
-		go consumeCampaignDispatch(channel)
-	} else {
-		appruntime.LogStartup("dispatcher-service rabbitmq", err)
-	}
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-	mux := httpapi.NewMux(httpapi.Service{Name: "dispatcher-service", Version: "0.2.0", Ready: func() bool { return mq != nil }})
+	go appruntime.RunWithReconnect(ctx, "dispatcher-service", func(ctx context.Context, ch *amqp.Channel) error {
+		mqMu.Lock()
+		mq = ch
+		mqMu.Unlock()
+		defer func() {
+			mqMu.Lock()
+			mq = nil
+			mqMu.Unlock()
+		}()
+		return consumeCampaignDispatch(ctx, ch)
+	})
+
+	mux := httpapi.NewMux(httpapi.Service{
+		Name:    "dispatcher-service",
+		Version: "0.3.0",
+		Ready: func() bool {
+			mqMu.Lock()
+			defer mqMu.Unlock()
+			return mq != nil
+		},
+	})
 	mux.HandleFunc("/dispatch/preview", previewDispatch)
 	_ = httpapi.Listen("dispatcher-service", mux)
 }
@@ -49,14 +70,25 @@ func previewDispatch(w http.ResponseWriter, r *http.Request) {
 	httpapi.WriteJSON(w, http.StatusOK, campaigns.BuildDispatchBatches(req.UserIDs, req.Channels, req.BatchSize))
 }
 
-func consumeCampaignDispatch(channel *amqp.Channel) {
-	_ = channel.Qos(1, 0, false)
+func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel) error {
+	if err := channel.Qos(1, 0, false); err != nil {
+		return fmt.Errorf("qos: %w", err)
+	}
 	deliveries, err := channel.Consume(appruntime.QueueCampaignDispatch, "dispatcher-service", false, false, false, false, nil)
 	if err != nil {
-		slog.Error("consume campaign dispatch", "error", err)
-		return
+		return fmt.Errorf("consume: %w", err)
 	}
-	for delivery := range deliveries {
+	for {
+		var delivery amqp.Delivery
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return nil
+		case delivery, ok = <-deliveries:
+			if !ok {
+				return errors.New("delivery channel closed")
+			}
+		}
 		var req contracts.CampaignDispatchRequest
 		if err := appruntime.DecodeJSON(delivery, &req); err != nil {
 			_ = delivery.Nack(false, false)
@@ -113,6 +145,7 @@ func consumeCampaignDispatch(channel *amqp.Channel) {
 		slog.Info("campaign dispatch tick", "campaign_id", req.CampaignID, "recipients", window.End-window.Start+1, "next_start", window.NextStart, "duration_ms", time.Since(start).Milliseconds(), "p95_dispatch_ms", p95)
 	}
 }
+
 
 func campaignDispatchActive(ctx context.Context, campaignID string) (bool, error) {
 	if campaignID == "" {

@@ -3,6 +3,7 @@ name: norify
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: norify
       POSTGRES_USER: norify
@@ -19,6 +20,7 @@ services:
 
   postgres-viewer:
     image: sosedoff/pgweb:latest
+    restart: unless-stopped
     command:
       - --bind=0.0.0.0
       - --listen=8081
@@ -31,6 +33,7 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -48,6 +51,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -60,6 +64,7 @@ services:
     build:
       context: .
       dockerfile: services/auth-service/Dockerfile
+    restart: unless-stopped
     environment:
       PORT: 8080
       JWT_SECRET: local-dev-secret
@@ -74,6 +79,7 @@ services:
     build:
       context: .
       dockerfile: services/user-service/Dockerfile
+    restart: unless-stopped
     ports:
       - "8082:8080"
     depends_on:
@@ -84,6 +90,7 @@ services:
     build:
       context: .
       dockerfile: services/template-service/Dockerfile
+    restart: unless-stopped
     environment:
       POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
     ports:
@@ -96,6 +103,7 @@ services:
     build:
       context: .
       dockerfile: services/channel-service/Dockerfile
+    restart: unless-stopped
     environment:
       POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
     ports:
@@ -108,6 +116,7 @@ services:
     build:
       context: .
       dockerfile: services/campaign-service/Dockerfile
+    restart: unless-stopped
     environment:
       POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
@@ -124,6 +133,7 @@ services:
     build:
       context: .
       dockerfile: services/dispatcher-service/Dockerfile
+    restart: unless-stopped
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       CAMPAIGN_SERVICE_URL: http://campaign-service:8080
@@ -137,10 +147,15 @@ services:
     build:
       context: .
       dockerfile: services/sender-worker/Dockerfile
+    restart: unless-stopped
     environment:
       POSTGRES_DSN: postgres://norify:norify@postgres:5432/norify?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      WORKER_PREFETCH: 30
+      WORKER_PREFETCH: 20
+      WORKER_MIN_POOL: 2
+      WORKER_MAX_POOL: 8
+      WORKER_SCALE_INTERVAL_SECONDS: 5
+      WORKER_SCALE_MAX_DEPTH: 200
       CHANNEL_STUB_MIN_DELAY_SECONDS: 1
       CHANNEL_STUB_MAX_DELAY_SECONDS: 3
     ports:
@@ -155,12 +170,14 @@ services:
     build:
       context: .
       dockerfile: services/notification-error-service/Dockerfile
+    restart: unless-stopped
     ports:
       - "8088:8080"
 
   status-service:
     build:
       context: ./apps/status-service
+    restart: unless-stopped
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       AUTH_SERVICE_URL: http://auth-service:8080
@@ -180,6 +197,7 @@ services:
 
   frontend:
     image: norify-frontend:latest
+    restart: unless-stopped
     build:
       context: ./apps/frontend
     ports:

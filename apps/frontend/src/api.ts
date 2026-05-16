@@ -336,6 +336,29 @@ export async function fetchServiceHealth(): Promise<ServiceHealth[]> {
   return Promise.all(serviceHealthTargets.map(checkServiceHealth));
 }
 
+export type WorkerStats = {
+  activeWorkers: number;
+  minWorkers: number;
+  maxWorkers: number;
+  queueDepth: number;
+};
+
+export async function fetchWorkerStats(): Promise<WorkerStats | null> {
+  try {
+    const response = await fetch(`${api.sender}/worker/stats`, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return {
+      activeWorkers: data.active_workers ?? 0,
+      minWorkers: data.min_workers ?? 0,
+      maxWorkers: data.max_workers ?? 0,
+      queueDepth: data.queue_depth ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function checkServiceHealth(target: (typeof serviceHealthTargets)[number]): Promise<ServiceHealth> {
   const startedAt = performance.now();
   const checkedAt = new Date().toISOString();

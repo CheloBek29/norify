@@ -32,6 +32,8 @@ import {
   fetchDeliveries,
   fetchErrorGroups,
   fetchServiceHealth,
+  fetchWorkerStats,
+  type WorkerStats,
   fetchTemplates,
   fetchTemplateVariables,
   normalizeCampaign,
@@ -1792,6 +1794,7 @@ function Managers({ role, managers, onAdd }: { role: Role; managers: Manager[]; 
 
 function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: ServiceHealth[]; onRefresh: () => Promise<ServiceHealth[]> }) {
   const [refreshing, setRefreshing] = useState(false);
+  const [workerStats, setWorkerStats] = useState<WorkerStats | null>(null);
   const onRefreshRef = useRef(onRefresh);
   const readyCount = checks.filter((check) => check.status === "ready").length;
   const downCount = checks.filter((check) => check.status === "down").length;
@@ -1815,8 +1818,46 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    function pollWorkerStats() {
+      void fetchWorkerStats().then(setWorkerStats);
+    }
+    pollWorkerStats();
+    const timer = window.setInterval(pollWorkerStats, 3000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const workerFill = workerStats ? Math.round((workerStats.activeWorkers / workerStats.maxWorkers) * 100) : 0;
+
   return (
     <div className="pageGrid">
+      <section className="panel wide">
+        <div className="panelHeader"><h2>Пул воркеров отправки</h2></div>
+        {workerStats ? (
+          <div className="workerStatsGrid">
+            <div className="workerStatCard workerStatMain">
+              <span className="workerStatLabel">Активных воркеров</span>
+              <strong className="workerStatValue">{workerStats.activeWorkers}</strong>
+              <span className="workerStatSub">из {workerStats.minWorkers}–{workerStats.maxWorkers}</span>
+              <div className="workerBar">
+                <div className="workerBarFill" style={{ width: `${workerFill}%` }} />
+              </div>
+            </div>
+            <div className="workerStatCard">
+              <span className="workerStatLabel">Сообщений в очереди</span>
+              <strong className="workerStatValue">{workerStats.queueDepth >= 0 ? workerStats.queueDepth.toLocaleString() : "—"}</strong>
+              <span className="workerStatSub">message.send.request</span>
+            </div>
+            <div className="workerStatCard">
+              <span className="workerStatLabel">Масштабирование</span>
+              <strong className="workerStatValue">{workerStats.minWorkers}–{workerStats.maxWorkers}</strong>
+              <span className="workerStatSub">мин–макс воркеров</span>
+            </div>
+          </div>
+        ) : (
+          <p style={{ padding: "1rem", color: "var(--muted)" }}>sender-worker недоступен</p>
+        )}
+      </section>
       <section className="panel wide">
         <div className="panelHeader">
           <h2>Готовность микросервисов</h2>

@@ -4,8 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,89 +23,251 @@ import (
 )
 
 var db *pgxpool.Pool
-var mq *amqp.Channel
+
+// pubCh is a shared channel used only for publishing outbound events and retries.
+// It is managed by maintainPubChannel and accessed under pubMu.
+var (
+	pubCh *amqp.Channel
+	pubMu sync.Mutex
+)
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	var err error
 	db, err = appruntime.OpenPostgres(ctx)
 	appruntime.LogStartup("sender-worker postgres", err)
-	if conn, channel, qErr := appruntime.OpenRabbit(); qErr == nil {
-		defer conn.Close()
-		defer channel.Close()
-		mq = channel
-		go consumeMessages(channel)
-	} else {
-		appruntime.LogStartup("sender-worker rabbitmq", qErr)
-	}
 
-	mux := httpapi.NewMux(httpapi.Service{Name: "sender-worker", Version: "0.2.0", Ready: func() bool { return db != nil && mq != nil }})
+	// Keep a dedicated publishing channel alive for HTTP handler and process().
+	go appruntime.RunWithReconnect(ctx, "sender-worker-pub", func(ctx context.Context, ch *amqp.Channel) error {
+		pubMu.Lock()
+		pubCh = ch
+		pubMu.Unlock()
+		defer func() {
+			pubMu.Lock()
+			pubCh = nil
+			pubMu.Unlock()
+		}()
+		<-ctx.Done()
+		return nil
+	})
+
+	pool := newWorkerPool()
+	go pool.run(ctx)
+
+	mux := httpapi.NewMux(httpapi.Service{
+		Name:    "sender-worker",
+		Version: "0.3.0",
+		Ready:   func() bool { return db != nil },
+	})
 	mux.HandleFunc("/worker/send", sendOnce)
+	mux.HandleFunc("/worker/stats", pool.statsHandler)
 	_ = httpapi.Listen("sender-worker", mux)
 }
 
-func consumeMessages(channel *amqp.Channel) {
-	prefetch := appruntime.EnvInt("WORKER_PREFETCH", 20)
-	_ = channel.Qos(prefetch, 0, false)
-	deliveries, err := channel.Consume(appruntime.QueueMessageSend, "sender-worker", false, false, false, false, nil)
-	if err != nil {
-		slog.Error("consume message send", "error", err)
-		return
+// ---------------------------------------------------------------------------
+// Dynamic worker pool
+// ---------------------------------------------------------------------------
+
+type workerPool struct {
+	workers map[int]context.CancelFunc
+	mu      sync.Mutex
+	nextID  int
+	min     int
+	max     int
+}
+
+func newWorkerPool() *workerPool {
+	return &workerPool{
+		workers: make(map[int]context.CancelFunc),
+		min:     appruntime.EnvInt("WORKER_MIN_POOL", 2),
+		max:     appruntime.EnvInt("WORKER_MAX_POOL", 10),
 	}
-	results := make(chan deliveryResult)
-	inFlight := 0
-	for deliveries != nil || inFlight > 0 {
-		activeDeliveries := deliveries
-		if inFlight >= prefetch {
-			activeDeliveries = nil
-		}
+}
+
+func (p *workerPool) run(parentCtx context.Context) {
+	p.mu.Lock()
+	for len(p.workers) < p.min {
+		p.launch(parentCtx)
+	}
+	p.mu.Unlock()
+
+	interval := time.Duration(appruntime.EnvInt("WORKER_SCALE_INTERVAL_SECONDS", 5)) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
 		select {
-		case delivery, ok := <-activeDeliveries:
+		case <-parentCtx.Done():
+			p.mu.Lock()
+			for _, cancel := range p.workers {
+				cancel()
+			}
+			p.mu.Unlock()
+			return
+		case <-ticker.C:
+			p.scale(parentCtx)
+		}
+	}
+}
+
+func (p *workerPool) scale(parentCtx context.Context) {
+	depth := appruntime.QueueDepth(appruntime.QueueMessageSend)
+	target := p.targetSize(depth)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for len(p.workers) < target {
+		p.launch(parentCtx)
+	}
+	for len(p.workers) > target {
+		p.killOne()
+	}
+}
+
+// targetSize maps queue depth to desired worker count using linear interpolation.
+func (p *workerPool) targetSize(depth int) int {
+	if depth < 0 {
+		// Management API unreachable — keep current count, but no less than min.
+		if len(p.workers) > p.min {
+			return len(p.workers)
+		}
+		return p.min
+	}
+	maxDepth := appruntime.EnvInt("WORKER_SCALE_MAX_DEPTH", 200)
+	if maxDepth <= 0 {
+		maxDepth = 200
+	}
+	target := p.min + (p.max-p.min)*depth/maxDepth
+	if target < p.min {
+		return p.min
+	}
+	if target > p.max {
+		return p.max
+	}
+	return target
+}
+
+func (p *workerPool) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.workers)
+}
+
+func (p *workerPool) statsHandler(w http.ResponseWriter, _ *http.Request) {
+	depth := appruntime.QueueDepth(appruntime.QueueMessageSend)
+	httpapi.WriteJSON(w, http.StatusOK, map[string]int{
+		"active_workers": p.count(),
+		"min_workers":    p.min,
+		"max_workers":    p.max,
+		"queue_depth":    depth,
+	})
+}
+
+func (p *workerPool) launch(parentCtx context.Context) {
+	id := p.nextID
+	p.nextID++
+	workerCtx, cancel := context.WithCancel(parentCtx)
+	p.workers[id] = cancel
+
+	name := fmt.Sprintf("sender-worker-%d", id)
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			delete(p.workers, id)
+			p.mu.Unlock()
+		}()
+		appruntime.RunWithReconnect(workerCtx, name, consumeMessages)
+		slog.Info("worker stopped", "worker", name)
+	}()
+	slog.Info("worker started", "worker", name, "total", len(p.workers))
+}
+
+func (p *workerPool) killOne() {
+	// Stop the highest-ID worker (most recently started).
+	maxID := -1
+	for id := range p.workers {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	if maxID >= 0 {
+		p.workers[maxID]()
+		delete(p.workers, maxID)
+		slog.Info("worker scaled down", "worker_id", maxID, "remaining", len(p.workers))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Consumer
+// ---------------------------------------------------------------------------
+
+func consumeMessages(ctx context.Context, ch *amqp.Channel) error {
+	prefetch := appruntime.EnvInt("WORKER_PREFETCH", 20)
+	if err := ch.Qos(prefetch, 0, false); err != nil {
+		return fmt.Errorf("qos: %w", err)
+	}
+	deliveries, err := ch.Consume(appruntime.QueueMessageSend, "", false, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("consume: %w", err)
+	}
+
+	type deliveryResult struct {
+		delivery amqp.Delivery
+		request  contracts.SendMessageRequest
+		err      error
+		requeue  bool
+	}
+
+	results := make(chan deliveryResult, prefetch)
+	inFlight := 0
+
+	for {
+		var incoming <-chan amqp.Delivery
+		if inFlight < prefetch {
+			incoming = deliveries
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case delivery, ok := <-incoming:
 			if !ok {
-				deliveries = nil
-				continue
+				return errors.New("delivery channel closed")
 			}
 			inFlight++
-			go processDelivery(delivery, results)
+			go func(d amqp.Delivery) {
+				var req contracts.SendMessageRequest
+				if err := appruntime.DecodeJSON(d, &req); err != nil {
+					results <- deliveryResult{delivery: d, err: err}
+					return
+				}
+				err := processWithChannel(ctx, ch, req)
+				results <- deliveryResult{delivery: d, request: req, err: err, requeue: err != nil}
+			}(delivery)
 		case result := <-results:
 			inFlight--
-			ackDeliveryResult(result)
+			if result.err == nil {
+				_ = result.delivery.Ack(false)
+			} else if result.requeue {
+				slog.Error("process failed, requeuing",
+					"campaign_id", result.request.CampaignID,
+					"user_id", result.request.UserID,
+					"channel", result.request.ChannelCode,
+					"error", result.err)
+				_ = result.delivery.Nack(false, true)
+			} else {
+				_ = result.delivery.Nack(false, false)
+			}
 		}
 	}
 }
 
-type deliveryResult struct {
-	delivery amqp.Delivery
-	request  contracts.SendMessageRequest
-	err      error
-	requeue  bool
-}
-
-func processDelivery(delivery amqp.Delivery, results chan<- deliveryResult) {
-	var req contracts.SendMessageRequest
-	if err := appruntime.DecodeJSON(delivery, &req); err != nil {
-		results <- deliveryResult{delivery: delivery, err: err}
-		return
-	}
-	if err := process(context.Background(), req); err != nil {
-		results <- deliveryResult{delivery: delivery, request: req, err: err, requeue: true}
-		return
-	}
-	results <- deliveryResult{delivery: delivery, request: req}
-}
-
-func ackDeliveryResult(result deliveryResult) {
-	if result.err == nil {
-		_ = result.delivery.Ack(false)
-		return
-	}
-	if result.requeue {
-		slog.Error("process send request", "campaign_id", result.request.CampaignID, "user_id", result.request.UserID, "channel", result.request.ChannelCode, "error", result.err)
-		_ = result.delivery.Nack(false, true)
-		return
-	}
-	_ = result.delivery.Nack(false, false)
-}
+// ---------------------------------------------------------------------------
+// HTTP handler
+// ---------------------------------------------------------------------------
 
 func sendOnce(w http.ResponseWriter, r *http.Request) {
 	var req contracts.SendMessageRequest
@@ -111,14 +278,21 @@ func sendOnce(w http.ResponseWriter, r *http.Request) {
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
 	}
-	if err := process(r.Context(), req); err != nil {
+	pubMu.Lock()
+	ch := pubCh
+	pubMu.Unlock()
+	if err := processWithChannel(r.Context(), ch, req); err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	httpapi.WriteJSON(w, http.StatusOK, map[string]string{"status": "processed", "idempotency_key": req.IdempotencyKey})
 }
 
-func process(ctx context.Context, req contracts.SendMessageRequest) error {
+// ---------------------------------------------------------------------------
+// Core processing
+// ---------------------------------------------------------------------------
+
+func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.SendMessageRequest) error {
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
 	}
@@ -145,29 +319,35 @@ func process(ctx context.Context, req contracts.SendMessageRequest) error {
 			return err
 		}
 	}
+	if ch == nil {
+		return nil
+	}
 	eventType := "message.sent"
 	if status == "failed" {
 		eventType = "message.failed"
 	}
 	event := contracts.MessageStatusEvent{
-		Type: eventType, CampaignID: req.CampaignID, TotalMessages: campaignTotal(ctx, req.CampaignID), UserID: req.UserID, ChannelCode: req.ChannelCode,
-		Status: status, ErrorCode: result.ErrorCode, ErrorMessage: result.Error, Attempt: req.Attempt,
+		Type: eventType, CampaignID: req.CampaignID, TotalMessages: campaignTotal(ctx, req.CampaignID),
+		UserID: req.UserID, ChannelCode: req.ChannelCode, Status: status,
+		ErrorCode: result.ErrorCode, ErrorMessage: result.Error, Attempt: req.Attempt,
 		IdempotencyKey: req.IdempotencyKey, FinishedAt: result.FinishedAt,
 	}
-	if mq != nil {
-		if err := appruntime.PublishJSON(ctx, mq, appruntime.ExchangeMessageStatus, eventType, event); err != nil {
-			return err
-		}
+	if err := appruntime.PublishJSON(ctx, ch, appruntime.ExchangeMessageStatus, eventType, event); err != nil {
+		return err
 	}
-	if status == "failed" && mq != nil && req.Attempt < config.RetryLimit {
+	if status == "failed" && req.Attempt < config.RetryLimit {
 		req.Attempt++
-		return appruntime.PublishJSON(ctx, mq, "", appruntime.QueueMessageRetry, req)
+		return appruntime.PublishJSON(ctx, ch, "", appruntime.QueueMessageRetry, req)
 	}
-	if status == "failed" && mq != nil {
-		return appruntime.PublishJSON(ctx, mq, "", appruntime.QueueMessageDLQ, req)
+	if status == "failed" {
+		return appruntime.PublishJSON(ctx, ch, "", appruntime.QueueMessageDLQ, req)
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// DB helpers
+// ---------------------------------------------------------------------------
 
 func campaignProcessingActive(ctx context.Context, campaignID string) (bool, error) {
 	if db == nil || campaignID == "" {
@@ -185,10 +365,10 @@ func canProcessCampaignStatus(status string) bool {
 }
 
 func campaignTotal(ctx context.Context, campaignID string) int {
-	var total int
 	if db == nil {
 		return 0
 	}
+	var total int
 	_ = db.QueryRow(ctx, `SELECT total_messages FROM campaigns WHERE id = $1`, campaignID).Scan(&total)
 	return total
 }
