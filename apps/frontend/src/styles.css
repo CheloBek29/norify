@@ -917,5 +917,75 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
   gap: 8px;
   flex-wrap: wrap;
 }
-.aiActions button { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.9rem; background: var(--surface); }
+.aiActions button { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.9rem; background: var(--surface); color: var(--text); }
+.aiActions button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+.aiActions button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 80%, #000); }
 .aiHtmlResult { margin-top: 8px; }
+.aiTextHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.aiTextHeader h3 { margin: 0; }
+.aiEditToggle {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  background: var(--bg);
+  color: var(--text);
+}
+.aiTextPreview {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  font-size: 0.95rem;
+  line-height: 1.7;
+  max-height: 340px;
+  overflow-y: auto;
+  color: var(--text);
+}
+.aiTextPreview p { margin: 0 0 10px; }
+.aiTextPreview h3 { margin: 16px 0 6px; }
+.aiTextPreview strong { font-weight: 700; }
+.aiTextarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+.aiHtmlFrame {
+  width: 100%;
+  height: 560px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 4px;
+}
+.aiLoading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 24px;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  justify-content: center;
+}
+.aiSpinner {
+  width: 20px;
+  height: 20px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

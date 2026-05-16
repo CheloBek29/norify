@@ -1055,17 +1055,66 @@ const TEMPLATE_GENERATOR_URL = "http://localhost:8091";
 type AIStyle = "professional" | "creative" | "luxury" | "minimal" | "ecommerce";
 
 function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
-  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [step, setStep] = useState<1 | 2>(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [taskDesc, setTaskDesc] = useState("");
   const [style, setStyle] = useState<AIStyle>("professional");
   const [generatedText, setGeneratedText] = useState("");
-  const [brandName, setBrandName] = useState("My Company");
-  const [brandEmail, setBrandEmail] = useState("info@example.com");
-  const [imageB64, setImageB64] = useState("");
-  const [generatedHTML, setGeneratedHTML] = useState("");
-  const [showPreview, setShowPreview] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+
+  function mdToHtml(md: string): string {
+    const lines = md.split("\n");
+    const out: string[] = [];
+    let inList = false;
+
+    for (const raw of lines) {
+      // убираем Subject line
+      if (/^(\*\*)?subject/i.test(raw.trim())) continue;
+
+      let line = raw
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*(.+?)\*/g, "<em>$1</em>")
+        .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+
+      // headings
+      const hMatch = line.match(/^#{1,3}\s+(.+)/);
+      if (hMatch) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push(`<h3>${hMatch[1]}</h3>`);
+        continue;
+      }
+
+      // subject line
+      if (line.toLowerCase().startsWith("<strong>subject") || line.toLowerCase().startsWith("subject")) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push(`<p class="aiSubject">${line}</p>`);
+        continue;
+      }
+
+      // blank line
+      if (line.trim() === "") {
+        if (inList) { out.push("</ul>"); inList = false; }
+        continue;
+      }
+
+      // bullet/emoji list items: lines starting with -, *, •, or emoji+space
+      const listMatch = line.match(/^[-*•]\s+(.+)/) || line.match(/^([✅✔️▶️➡️🔹🔸💡📌⭐🌟])\s+(.+)/);
+      if (listMatch) {
+        if (!inList) { out.push("<ul>"); inList = true; }
+        const content = listMatch[2] ?? listMatch[1];
+        const prefix = listMatch[2] ? listMatch[1] + " " : "";
+        out.push(`<li>${prefix}${content}</li>`);
+        continue;
+      }
+
+      if (inList) { out.push("</ul>"); inList = false; }
+      out.push(`<p>${line}</p>`);
+    }
+
+    if (inList) out.push("</ul>");
+    return out.join("\n");
+  }
 
   async function handleGenerateText() {
     setError(null);
@@ -1079,6 +1128,7 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Generation failed");
       setGeneratedText(data.text);
+      setEditMode(false);
       setStep(2);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -1087,47 +1137,13 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
     }
   }
 
-  async function handleGenerateHTML() {
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await fetch(`${TEMPLATE_GENERATOR_URL}/api/generate-html`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ newsletter_text: generatedText, brand_name: brandName, brand_email: brandEmail, image_base64: imageB64 || undefined }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "HTML generation failed");
-      setGeneratedHTML(data.html);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onloadend = () => setImageB64(reader.result as string);
-    reader.readAsDataURL(file);
-  }
-
-  function downloadHTML() {
-    const a = document.createElement("a");
-    a.href = "data:text/html;charset=utf-8," + encodeURIComponent(generatedHTML);
-    a.download = "newsletter.html";
-    a.click();
-  }
-
   return (
     <div className="aiGenerator">
       <div className="aiSteps">
-        {([1, 2, 3] as const).map((s) => (
+        {([1, 2] as const).map((s) => (
           <div key={s} className={`aiStep${step === s ? " active" : step > s ? " done" : ""}`}>
             <span>{s}</span>
-            <p>{s === 1 ? "Описание" : s === 2 ? "Текст" : "HTML"}</p>
+            <p>{s === 1 ? "Описание" : "Результат"}</p>
           </div>
         ))}
       </div>
@@ -1137,7 +1153,10 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
       {step === 1 && (
         <div className="aiPanel">
           <h3>Опишите задачу для рассылки</h3>
-          <label>Описание<textarea value={taskDesc} onChange={(e) => setTaskDesc(e.target.value)} rows={5} placeholder="Пример: Создай рассылку для интернет-магазина. Скидка 30% на смартфоны. Аудитория: 18-35 лет." /></label>
+          <label>Описание
+            <textarea value={taskDesc} onChange={(e) => setTaskDesc(e.target.value)} rows={5}
+              placeholder="Пример: Создай рассылку для интернет-магазина. Скидка 30% на смартфоны. Аудитория: 18-35 лет." />
+          </label>
           <label>Стиль
             <select value={style} onChange={(e) => setStyle(e.target.value as AIStyle)}>
               <option value="professional">Профессиональный</option>
@@ -1148,45 +1167,29 @@ function AIGenerator({ onApply }: { onApply: (text: string) => void }) {
             </select>
           </label>
           <button className="primary" disabled={taskDesc.length < 10 || loading} onClick={handleGenerateText}>
-            {loading ? "Генерирую... (30-60 сек)" : "Сгенерировать текст"}
+            {loading ? "Генерирую..." : "Сгенерировать текст →"}
           </button>
         </div>
       )}
 
       {step === 2 && (
         <div className="aiPanel">
-          <h3>Готовый текст рассылки</h3>
-          <label>Отредактируйте при необходимости<textarea value={generatedText} onChange={(e) => setGeneratedText(e.target.value)} rows={10} /></label>
-          <div className="aiActions">
-            <button onClick={() => setStep(1)}>← Назад</button>
-            <button onClick={() => { onApply(generatedText); }}>Использовать как шаблон</button>
-            <button className="primary" onClick={() => setStep(3)}>Создать HTML →</button>
+          <div className="aiTextHeader">
+            <h3>Готовый текст рассылки</h3>
+            <button className="aiEditToggle" onClick={() => setEditMode(!editMode)}>
+              {editMode ? "Предпросмотр" : "Редактировать"}
+            </button>
           </div>
-        </div>
-      )}
-
-      {step === 3 && (
-        <div className="aiPanel">
-          <h3>Создание HTML шаблона</h3>
-          <div className="fieldGrid">
-            <label>Название компании<input value={brandName} onChange={(e) => setBrandName(e.target.value)} /></label>
-            <label>Email<input type="email" value={brandEmail} onChange={(e) => setBrandEmail(e.target.value)} /></label>
-          </div>
-          <label>Логотип / изображение (опционально)<input type="file" accept="image/*" onChange={handleImageUpload} /></label>
-          {imageB64 && <img src={imageB64} alt="preview" style={{ maxHeight: 80, marginTop: 8 }} />}
-          <button className="primary" disabled={loading} onClick={handleGenerateHTML}>
-            {loading ? "Создаю шаблон... (15-30 сек)" : "Создать HTML шаблон"}
-          </button>
-          {generatedHTML && (
-            <div className="aiHtmlResult">
-              <div className="aiActions">
-                <button onClick={() => setShowPreview(!showPreview)}>{showPreview ? "Скрыть превью" : "Предпросмотр"}</button>
-                <button onClick={downloadHTML}>Скачать HTML</button>
-              </div>
-              {showPreview && <iframe srcDoc={generatedHTML} style={{ width: "100%", height: 500, border: "1px solid #ddd", marginTop: 12, borderRadius: 6 }} />}
-            </div>
+          {editMode ? (
+            <textarea className="aiTextarea" value={generatedText} onChange={(e) => setGeneratedText(e.target.value)} rows={14} />
+          ) : (
+            <div className="aiTextPreview" dangerouslySetInnerHTML={{ __html: mdToHtml(generatedText) }} />
           )}
-          <button onClick={() => setStep(2)} style={{ marginTop: 8 }}>← Назад</button>
+          <div className="aiActions">
+            <button onClick={() => { setStep(1); setGeneratedText(""); }}>← Назад</button>
+            <button onClick={() => handleGenerateText()} disabled={loading}>{loading ? "Генерирую..." : "Перегенерировать"}</button>
+            <button className="primary" onClick={() => onApply(generatedText)}>Использовать текст →</button>
+          </div>
         </div>
       )}
     </div>

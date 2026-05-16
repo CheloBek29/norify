@@ -8,20 +8,20 @@ from prompts import PROMPT_NEWSLETTER_TEMPLATE, STYLES, SYSTEM_PROMPT_BASE
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
 async def _call_openai(system: str, user: str) -> str:
-    if not OPENAI_API_KEY:
-        return "Error: OPENAI_API_KEY not set"
+    if not MISTRAL_API_KEY:
+        return "Error: MISTRAL_API_KEY not set"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": OPENAI_MODEL,
+        "model": MISTRAL_MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -30,8 +30,8 @@ async def _call_openai(system: str, user: str) -> str:
         "max_tokens": 1500,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OPENAI_API_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+            async with session.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data["choices"][0]["message"]["content"]
@@ -43,9 +43,14 @@ async def _call_openai(system: str, user: str) -> str:
 
 class TemplateGenerator:
     async def generate_text(self, task_description: str, style: str = "professional") -> dict:
-        style_desc = STYLES.get(style, STYLES["professional"])
-        user_prompt = PROMPT_NEWSLETTER_TEMPLATE.format(SYSTEM_PROMPT_BASE, task_description, style_desc)
-        logger.info("Generating newsletter text...")
+        style_data = STYLES.get(style, STYLES["professional"])
+        user_prompt = PROMPT_NEWSLETTER_TEMPLATE.format(
+            SYSTEM_PROMPT_BASE,
+            task_description,
+            style_data["desc"],
+            style_data["structure"],
+        )
+        logger.info("Generating newsletter text, style=%s", style)
         text = await _call_openai(SYSTEM_PROMPT_BASE, user_prompt)
         if text.startswith("Error"):
             return {"success": False, "error": text}
