@@ -146,7 +146,6 @@ func consumeCampaignDispatch(ctx context.Context, channel *amqp.Channel) error {
 	}
 }
 
-
 func campaignDispatchActive(ctx context.Context, campaignID string) (bool, error) {
 	if campaignID == "" {
 		return false, nil
@@ -203,7 +202,8 @@ func dispatchRecipientWindow(req contracts.CampaignDispatchRequest, maxMessages 
 	if start <= 0 {
 		start = 1
 	}
-	channelsCount := len(req.SelectedChannels)
+	totalRecipients := dispatchRecipientCount(req)
+	channelsCount := dispatchWindowChannelCount(req)
 	if channelsCount <= 0 {
 		channelsCount = 1
 	}
@@ -215,14 +215,31 @@ func dispatchRecipientWindow(req contracts.CampaignDispatchRequest, maxMessages 
 		recipients = 1
 	}
 	end := start + recipients - 1
-	if end > req.TotalRecipients {
-		end = req.TotalRecipients
+	if end > totalRecipients {
+		end = totalRecipients
 	}
 	nextStart := 0
-	if end < req.TotalRecipients {
+	if end < totalRecipients {
 		nextStart = end + 1
 	}
 	return recipientWindow{Start: start, End: end, NextStart: nextStart}
+}
+
+func dispatchRecipientCount(req contracts.CampaignDispatchRequest) int {
+	if len(req.SpecificRecipients) > 0 {
+		return len(req.SpecificRecipients)
+	}
+	return req.TotalRecipients
+}
+
+func dispatchWindowChannelCount(req contracts.CampaignDispatchRequest) int {
+	count := len(req.SelectedChannels)
+	for _, recipient := range req.SpecificRecipients {
+		if len(recipient.Channels) > count {
+			count = len(recipient.Channels)
+		}
+	}
+	return count
 }
 
 func dispatch(ctx context.Context, channel *amqp.Channel, req contracts.CampaignDispatchRequest, window recipientWindow) ([]time.Duration, error) {
@@ -236,25 +253,58 @@ func dispatch(ctx context.Context, channel *amqp.Channel, req contracts.Campaign
 		if end > window.End {
 			end = window.End
 		}
-		for i := start; i <= end; i++ {
-			userID := userID(i)
-			for _, channelCode := range req.SelectedChannels {
-				send := contracts.SendMessageRequest{
-					CampaignID:     req.CampaignID,
-					UserID:         userID,
-					ChannelCode:    channelCode,
-					MessageBody:    req.MessageBody,
-					Attempt:        1,
-					IdempotencyKey: campaigns.IdempotencyKey(req.CampaignID, userID, channelCode),
-				}
-				if err := appruntime.PublishJSON(ctx, channel, "", appruntime.QueueMessageSend, send); err != nil {
-					return samples, err
-				}
+		for _, send := range buildSendMessages(req, recipientWindow{Start: start, End: end}) {
+			if err := appruntime.PublishJSON(ctx, channel, "", appruntime.QueueMessageSend, send); err != nil {
+				return samples, err
 			}
 		}
 		samples = append(samples, time.Since(batchStartedAt))
 	}
 	return samples, nil
+}
+
+func buildSendMessages(req contracts.CampaignDispatchRequest, window recipientWindow) []contracts.SendMessageRequest {
+	messages := []contracts.SendMessageRequest{}
+	for i := window.Start; i <= window.End; i++ {
+		userID := userID(i)
+		channels := req.SelectedChannels
+		if len(req.SpecificRecipients) > 0 {
+			if i < 1 || i > len(req.SpecificRecipients) {
+				continue
+			}
+			recipient := req.SpecificRecipients[i-1]
+			userID = recipient.UserID
+			if len(recipient.Channels) > 0 {
+				channels = recipient.Channels
+			}
+		}
+		for _, channelCode := range channels {
+			messages = append(messages, contracts.SendMessageRequest{
+				CampaignID:     req.CampaignID,
+				UserID:         userID,
+				ChannelCode:    channelCode,
+				MessageBody:    req.MessageBody,
+				Attempt:        1,
+				IdempotencyKey: campaigns.IdempotencyKey(req.CampaignID, userID, channelCode),
+			})
+		}
+	}
+	return messages
+}
+
+func dispatchTotalMessages(req contracts.CampaignDispatchRequest) int {
+	if len(req.SpecificRecipients) == 0 {
+		return req.TotalRecipients * len(req.SelectedChannels)
+	}
+	total := 0
+	for _, recipient := range req.SpecificRecipients {
+		if len(recipient.Channels) > 0 {
+			total += len(recipient.Channels)
+		} else {
+			total += len(req.SelectedChannels)
+		}
+	}
+	return total
 }
 
 func reportDispatchMetrics(ctx context.Context, req contracts.CampaignDispatchRequest, p95, batchCount int, duration time.Duration) error {
@@ -263,7 +313,7 @@ func reportDispatchMetrics(ctx context.Context, req contracts.CampaignDispatchRe
 	}
 	payload := contracts.CampaignDispatchMetrics{
 		CampaignID:    req.CampaignID,
-		TotalMessages: req.TotalRecipients * len(req.SelectedChannels),
+		TotalMessages: dispatchTotalMessages(req),
 		BatchCount:    batchCount,
 		DurationMs:    int(duration.Milliseconds()),
 		P95DispatchMs: p95,

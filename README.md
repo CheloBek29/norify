@@ -5,7 +5,7 @@ Production-like notification platform scaffold for managers and admins.
 ## Stack
 
 - Go microservices with shared contracts and TDD-covered core logic.
-- Python FastAPI `status-service` for WebSocket/status snapshots only.
+- Python FastAPI `ops-gateway` for UI commands, WebSocket progress, health aggregation, and worker control.
 - Vite React TypeScript frontend.
 - PostgreSQL, RabbitMQ, Redis.
 - Docker Compose for local dev and raw Kubernetes manifests for production-like deploy.

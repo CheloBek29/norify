@@ -16,11 +16,9 @@ import {
   campaignsSeed,
   channelsSeed,
   credentials,
-  currentError,
   defaultFilter,
   deliveriesSeed,
   effectiveTotalMessages,
-  errorGroupsSeed,
   eventsSeed,
   managersSeed,
   progressPercent,
@@ -32,13 +30,18 @@ import {
   fetchDeliveries,
   fetchErrorGroups,
   fetchServiceHealth,
+  fetchStatsSnapshot,
   fetchWorkerStats,
+  updateWorkerBounds,
   type WorkerStats,
   fetchTemplates,
   fetchTemplateVariables,
   normalizeCampaign,
+  normalizeStatsSnapshot,
   operationsWebSocketURL,
   serviceHealthTargets,
+  statsStreamURL,
+  type StatsSnapshot,
   templateVariablesSeed,
 } from "./api";
 
@@ -75,16 +78,19 @@ export function App() {
   const [session, setSession] = useLocalState<Session>("norify-session", null);
   const [theme, setTheme] = useLocalState<ThemeName>("norify-theme", "sky");
   const [customColor, setCustomColor] = useLocalState("norify-custom-color", "#1f95f2");
-  const [screen, setScreen] = useState<Screen>("dashboard");
+  const [screen, setScreen] = useState<Screen>(() => screenFromLocation());
   const [templates, setTemplates] = useLocalState<Template[]>("norify-templates", templatesSeed);
   const [templateVariables, setTemplateVariables] = useLocalState<TemplateVariable[]>("norify-template-variables", templateVariablesSeed);
   const [channels, setChannels] = useLocalState<Channel[]>("norify-channels", channelsSeed);
   const [campaigns, setCampaigns] = useLocalState<Campaign[]>("norify-campaigns", campaignsSeed);
   const [deliveries, setDeliveries] = useLocalState<Delivery[]>("norify-deliveries", deliveriesSeed);
-  const [errorGroups, setErrorGroups] = useLocalState<ErrorGroup[]>("norify-error-groups", errorGroupsSeed);
+  const [storedErrorGroups, setErrorGroups] = useLocalState<ErrorGroup[]>("norify-error-groups", []);
+  const errorGroups = storedErrorGroups.filter(isRealErrorGroup);
   const [events, setEvents] = useLocalState<SystemEvent[]>("norify-events", eventsSeed);
   const [managers, setManagers] = useLocalState<Manager[]>("norify-managers", managersSeed);
   const [healthChecks, setHealthChecks] = useState<ServiceHealth[]>(initialHealthChecks);
+  const [statsSnapshot, setStatsSnapshot] = useState<StatsSnapshot | null>(null);
+  const [statsState, setStatsState] = useState("stats connecting");
   const [selectedCampaignId, setSelectedCampaignId] = useState(campaigns[0]?.id ?? "");
   const [apiState, setApiState] = useState("connecting");
   const [pendingActionKeys, setPendingActionKeys] = useState<string[]>([]);
@@ -94,15 +100,86 @@ export function App() {
   const selectedCampaignIdRef = useRef(selectedCampaignId);
   const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
   const selectedCampaign = activeCampaigns.find((campaign) => campaign.id === selectedCampaignId) ?? activeCampaigns[0] ?? campaigns[0];
-  const activeError = selectedCampaign && selectedCampaign.failed > 0 ? buildError(selectedCampaign) : currentError;
+  const activeError = selectedCampaign ? buildError(selectedCampaign) : emptyActionableError();
+  const backendAvailable = healthChecks.some((check) => check.status === "ready");
+
+  useEffect(() => {
+    const path = pathForScreen(screen);
+    if (window.location.pathname !== path) {
+      window.history.pushState({ screen }, "", path);
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    const syncScreenFromHistory = () => setScreen(screenFromLocation());
+    window.addEventListener("popstate", syncScreenFromHistory);
+    return () => window.removeEventListener("popstate", syncScreenFromHistory);
+  }, []);
 
   useEffect(() => {
     selectedCampaignIdRef.current = selectedCampaignId;
   }, [selectedCampaignId]);
 
   useEffect(() => {
+    if (storedErrorGroups.length !== errorGroups.length) {
+      setErrorGroups(errorGroups);
+    }
+  }, [errorGroups, setErrorGroups, storedErrorGroups.length]);
+
+  useEffect(() => {
     if (!session) return;
     void refreshBackendData();
+  }, [session]);
+
+  useEffect(() => {
+    if (!backendAvailable) return;
+    setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+  }, [backendAvailable]);
+
+  useEffect(() => {
+    if (!session) return;
+    let closed = false;
+    setStatsState("stats connecting");
+    void fetchStatsSnapshot()
+      .then((snapshot) => {
+        if (closed) return;
+        setStatsSnapshot(snapshot);
+        setStatsState("stats snapshot");
+        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+      })
+      .catch(() => {
+        if (!closed) setStatsState("stats unavailable");
+      });
+
+    if (typeof EventSource === "undefined") {
+      return () => { closed = true; };
+    }
+    const stream = new EventSource(statsStreamURL());
+    const applySnapshot = (event: MessageEvent<string>) => {
+      try {
+        if (closed) return;
+        setStatsSnapshot(normalizeStatsSnapshot(JSON.parse(event.data) as Record<string, unknown>));
+        setStatsState("stats live");
+        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+      } catch (error) {
+        console.error("stats stream parse error:", error);
+      }
+    };
+    stream.addEventListener("snapshot", applySnapshot);
+    stream.onmessage = applySnapshot;
+    stream.onopen = () => {
+      if (!closed) {
+        setStatsState("stats live");
+        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+      }
+    };
+    stream.onerror = () => {
+      if (!closed) setStatsState((current) => current === "stats live" ? "stats reconnecting" : current);
+    };
+    return () => {
+      closed = true;
+      stream.close();
+    };
   }, [session]);
 
   async function refreshBackendData() {
@@ -130,7 +207,7 @@ export function App() {
     const idToFetch = activeCampaignId || (nextCampaigns.status === "fulfilled" && nextCampaigns.value[0]?.id) || "";
     if (idToFetch) {
       void fetchErrorGroups(idToFetch).then((groups) => {
-        if (groups.length > 0) setErrorGroups((prev) => [...groups, ...prev.filter((g) => g.campaignId !== idToFetch)]);
+        setErrorGroups((prev) => replaceCampaignErrorGroups(prev, idToFetch, groups));
       }).catch(() => undefined);
     }
   }
@@ -188,10 +265,7 @@ export function App() {
           applyCampaignSnapshot(snapshot);
           if (snapshot.campaign_id === selectedCampaignIdRef.current) {
             void fetchErrorGroups(snapshot.campaign_id).then((groups) => {
-              if (!closed && groups.length > 0) setErrorGroups((prev) => [
-                ...groups,
-                ...prev.filter((g) => g.campaignId !== snapshot.campaign_id),
-              ]);
+              if (!closed) setErrorGroups((prev) => replaceCampaignErrorGroups(prev, snapshot.campaign_id, groups));
             }).catch(() => undefined);
             void fetchDeliveries(snapshot.campaign_id).then((rows) => {
               if (!closed && rows.length > 0) setDeliveries(rows);
@@ -322,7 +396,10 @@ export function App() {
     setCreatePending(true);
     const template = templates.find((item) => item.id === wizard.templateId) ?? templates[0];
     const totalRecipients = wizard.specificUsers?.length ? wizard.specificUsers.length : audiencePreview(wizard.filter);
-    const totalMessages = totalRecipients * wizard.selectedChannels.length;
+    const specificRecipients = wizard.specificUsers?.map((user) => ({ user_id: user.userId, channels: user.channels })) ?? [];
+    const totalMessages = specificRecipients.length > 0
+      ? specificRecipients.reduce((sum, user) => sum + user.channels.length, 0)
+      : totalRecipients * wizard.selectedChannels.length;
 
     try {
       const result = await sendOpsCommand("campaign.create", {
@@ -331,6 +408,7 @@ export function App() {
         filters: wizard.filter,
         selected_channels: wizard.selectedChannels,
         total_recipients: totalRecipients,
+        specific_recipients: specificRecipients,
       });
       const backendCampaign = normalizeCampaign((result.campaign ?? result) as Record<string, unknown>);
       setCampaigns((items) => [backendCampaign, ...items.filter((item) => item.id !== backendCampaign.id)]);
@@ -483,7 +561,7 @@ export function App() {
             <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
-        {apiState === "local fallback" && (
+        {apiState === "local fallback" && !backendAvailable && (
           <div className="fallbackBanner" role="alert">
             Backend недоступен. Локальные демо-данные не считаются реальной доставкой; новые кампании и повторные действия не применяются без подтверждения backend.
           </div>
@@ -505,7 +583,7 @@ export function App() {
         {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
         {screen === "deliveries" && <Deliveries deliveries={deliveries} campaigns={campaigns} />}
-        {screen === "stats" && <Stats campaigns={campaigns} channels={channels} />}
+        {screen === "stats" && <Stats snapshot={statsSnapshot} statsState={statsState} />}
         {screen === "managers" && <Managers role={userSession.role} managers={managers} onAdd={addManager} />}
         {screen === "health" && <Health events={events} checks={healthChecks} onRefresh={refreshHealthViaWebSocket} />}
         {screen === "logs" && <Logs events={events} />}
@@ -727,7 +805,7 @@ function Dashboard({
           {campaign.failed > 0 && (
             <div className="recoveryActions" aria-label="Campaign recovery actions">
               <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
-              <span className="inlineNotice">Смена канала для всей кампании отключена в демо: используйте группы ошибок.</span>
+              <span className="inlineNotice">Смена канала для всей кампании отключена: используйте группы ошибок.</span>
             </div>
           )}
         </div>
@@ -823,14 +901,12 @@ function ErrorGroupsPanel({
   pendingActionKeys: string[];
 }) {
   return (
-    <section className="panel errorGroupsPanel">
+    <section className="panel errorGroupsPanel" aria-label="Группы ошибок">
       <div className="panelHeader">
-        <h2>Группы ошибок</h2>
-        <span className="queueMode"><Icon name="alert" /> живая очередь</span>
+        <h2>Группа ошибок</h2>
       </div>
       {groups.length > 0 ? (
         <>
-          <p className="muted">Основная кампания не прерывается; выбранные сообщения вставляются в текущую очередь с повышенным приоритетом.</p>
           <div className="errorGroups">
             {groups.map((group) => <ErrorGroupCard key={group.id} group={group} channels={channels} onAction={onGroupAction} pendingActionKeys={pendingActionKeys} />)}
           </div>
@@ -842,7 +918,7 @@ function ErrorGroupsPanel({
           {campaign.failed > 0 && (
             <div className="buttonRow">
               <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
-              <span className="inlineNotice">Смена канала для всей кампании отключена в демо: требуется точная маршрутизация по конкретным ошибочным доставкам.</span>
+              <span className="inlineNotice">Смена канала для всей кампании отключена: требуется точная маршрутизация по конкретным ошибочным доставкам.</span>
               <button className="danger" disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
             </div>
           )}
@@ -864,53 +940,76 @@ function ErrorGroupCard({
   pendingActionKeys: string[];
 }) {
   const alternativeChannels = channels.filter((channel) => channel.enabled && channel.code !== group.channelCode);
-  const [selectedChannel, setSelectedChannel] = useState(alternativeChannels[0]?.code ?? "");
+  const [selectedChannel, setSelectedChannel] = useState(preferredFallbackChannel(alternativeChannels));
+  const alternativeChannelKey = alternativeChannels.map((channel) => channel.code).join("|");
   const actions = group.recommendedActions.length > 0 ? group.recommendedActions : [
     { code: "retry", label: "Повторить группу" },
     { code: "switch_channel", label: "Вставить через другой канал" },
     { code: "cancel_group", label: "Закрыть группу" },
   ];
+  const hasAction = (code: "retry" | "switch_channel" | "cancel_group") => actions.some((action) => action.code === code);
+  const retryPending = pendingActionKeys.includes(errorGroupActionKey(group.id, "retry"));
+  const switchPending = pendingActionKeys.includes(errorGroupActionKey(group.id, "switch_channel"));
+  const cancelPending = pendingActionKeys.includes(errorGroupActionKey(group.id, "cancel_group"));
+
+  useEffect(() => {
+    if (selectedChannel && alternativeChannels.some((channel) => channel.code === selectedChannel)) return;
+    setSelectedChannel(preferredFallbackChannel(alternativeChannels));
+  }, [alternativeChannelKey, selectedChannel]);
+
+  function handleChannelSelect(nextChannel: string) {
+    setSelectedChannel(nextChannel);
+    if (!nextChannel || nextChannel === selectedChannel || switchPending) return;
+    onAction(group, "switch_channel", nextChannel);
+  }
+
   return (
     <article className="errorGroupCard">
       <div className="groupHeader">
         <div>
-          <strong>{group.channelCode}</strong>
-          <span>{group.errorCode || "delivery_failed"}</span>
+          <strong>{formatChannelName(group.channelCode)}</strong>
+          <p>{group.errorMessage || errorCodeLabel(group.errorCode)}</p>
+          {group.errorCode && <div className="groupMeta"><code>{group.errorCode}</code></div>}
         </div>
         <b>{group.failedCount.toLocaleString()}</b>
       </div>
-      <p>{group.errorMessage || "Ошибка доставки без сообщения адаптера"}</p>
-      <div className="groupMeta">
-        <span>попытка {group.maxAttempt}</span>
-        <span>{formatDate(group.firstSeenAt)} → {formatDate(group.lastSeenAt)}</span>
-      </div>
       <div className="groupImpact">{group.impact}</div>
       <div className="groupActions">
-        {actions.map((action) => {
-          const code = action.code as "retry" | "switch_channel" | "cancel_group";
-          if (code === "switch_channel") {
-            return (
-              <div key={code} className="switchChannelAction">
-                <label>Альтернативный канал
-                  <select value={selectedChannel} onChange={(event) => setSelectedChannel(event.target.value)}>
-                    {alternativeChannels.map((channel) => <option key={channel.code} value={channel.code}>{channel.name}</option>)}
-                  </select>
-                </label>
-                <button disabled={!selectedChannel || pendingActionKeys.includes(errorGroupActionKey(group.id, code))} onClick={() => onAction(group, code, selectedChannel)}>
-                  <Icon name="switch" /> Вставить
-                </button>
-              </div>
-            );
-          }
-          return (
-            <button key={code} className={code === "cancel_group" ? "danger" : ""} disabled={pendingActionKeys.includes(errorGroupActionKey(group.id, code))} onClick={() => onAction(group, code)}>
-              <Icon name={code === "retry" ? "retry" : "stop"} /> {action.label}
-            </button>
-          );
-        })}
+        {hasAction("retry") && (
+          <button disabled={retryPending} onClick={() => onAction(group, "retry")}>
+            Повторить
+          </button>
+        )}
+        {hasAction("switch_channel") && (
+          <label className="switchChannelAction">
+            <span className="srOnly">Альтернативный канал</span>
+            <select aria-label="Альтернативный канал" value={selectedChannel} disabled={!selectedChannel || switchPending} onChange={(event) => handleChannelSelect(event.target.value)}>
+              {alternativeChannels.map((channel) => <option key={channel.code} value={channel.code}>{formatChannelName(channel.code, channel.name)}</option>)}
+            </select>
+          </label>
+        )}
+        {hasAction("cancel_group") && (
+          <button className="danger" disabled={cancelPending} onClick={() => onAction(group, "cancel_group")}>
+            Закрыть
+          </button>
+        )}
       </div>
     </article>
   );
+}
+
+function preferredFallbackChannel(channels: Channel[]) {
+  return channels.find((channel) => channel.code === "custom_app")?.code ?? channels[0]?.code ?? "";
+}
+
+function formatChannelName(code: string, fallback?: string) {
+  if (code === "custom_app") return "CustomApp";
+  if (code === "max") return "Max";
+  return fallback ?? code;
+}
+
+function errorCodeLabel(code: string) {
+  return code ? `Код ошибки: ${code}` : "Ошибка доставки без сообщения адаптера";
 }
 
 function CampaignList({ campaigns, selectedId, onSelect, onAction, pendingActionKeys }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void; pendingActionKeys: string[] }) {
@@ -1228,12 +1327,16 @@ function CreateCampaign({ templates, channels, onCreate, pending }: { templates:
   const canStart = wizard.name.trim().length > 2 && Boolean(wizard.templateId) && wizard.selectedChannels.length > 0 && !pending;
 
   function toggleChannel(code: string) {
-    setWizard((current) => ({
-      ...current,
-      selectedChannels: current.selectedChannels.includes(code)
+    setWizard((current) => {
+      const selectedChannels = current.selectedChannels.includes(code)
         ? current.selectedChannels.filter((item) => item !== code)
-        : [...current.selectedChannels, code],
-    }));
+        : [...current.selectedChannels, code];
+      return {
+        ...current,
+        selectedChannels,
+        specificUsers: current.specificUsers?.map((user) => ({ ...user, channels: selectedChannels })),
+      };
+    });
   }
 
   function applySpecificUsers(users: SpecificUser[]) {
@@ -1274,8 +1377,8 @@ function CreateCampaign({ templates, channels, onCreate, pending }: { templates:
           <div className="panelHeader"><h2>Аудитория</h2><strong>{preview.toLocaleString()}</strong></div>
           {isSpecific ? (
             <div className="specificUsersChip">
-              <span><Icon name="users" /> {wizard.specificUsers!.length.toLocaleString()} пользователей как демо-сэмпл</span>
-              <small className="muted">{totalMessages.toLocaleString()} сообщений · backend получит количество и общие каналы, не точные ID</small>
+              <span><Icon name="users" /> {wizard.specificUsers!.length.toLocaleString()} пользователей выбрано точечно</span>
+              <small className="muted">{totalMessages.toLocaleString()} сообщений · backend dispatch получит выбранные ID</small>
               <div className="buttonRow tight">
                 <button onClick={() => setShowPicker(true)}>Изменить</button>
                 <button className="danger" onClick={() => setWizard((c) => ({ ...c, specificUsers: undefined }))}>Сбросить</button>
@@ -1303,7 +1406,6 @@ function CreateCampaign({ templates, channels, onCreate, pending }: { templates:
           <div className="formActions">
             <button onClick={() => setShowPicker(true)}><Icon name="users" /> {isSpecific ? "Изменить выбор" : "Выбрать точечно"}</button>
           </div>
-          <div className="demoNotice">Индивидуальный список сейчас используется только как честный demo sampling: backend dispatch не получает выбранные ID.</div>
         </section>
 
         <section className="panel formPanel">
@@ -1714,6 +1816,11 @@ function formatProbability(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function formatRate(value: number | null) {
+  if (value === null || Number.isNaN(value)) return "Нет данных";
+  return `${Math.round(value * 100)}%`;
+}
+
 function normalizeChannelPatch(raw: Record<string, unknown>): Partial<Channel> {
   const code = String(raw.code ?? raw.Code ?? "");
   return {
@@ -1883,34 +1990,144 @@ function Deliveries({ deliveries, campaigns }: { deliveries: Delivery[]; campaig
   );
 }
 
-function Stats({ campaigns, channels }: { campaigns: Campaign[]; channels: Channel[] }) {
-  const totals = campaigns.reduce((acc, campaign) => ({
-    messages: acc.messages + campaign.totalMessages,
-    success: acc.success + campaign.success,
-    failed: acc.failed + campaign.failed,
-    active: acc.active + (campaign.status === "running" || campaign.status === "retrying" ? 1 : 0),
-  }), { messages: 0, success: 0, failed: 0, active: 0 });
-  return (
-    <div className="pageGrid">
-      <section className="panel wide">
-        <div className="stats">
-          <Metric label="всего сообщений" value={totals.messages.toLocaleString()} />
-          <Metric label="успешно" value={totals.success.toLocaleString()} tone="success" />
-          <Metric label="ошибки" value={totals.failed.toLocaleString()} tone="danger" />
-          <Metric label="активные" value={String(totals.active)} />
+function Stats({ snapshot, statsState }: { snapshot: StatsSnapshot | null; statsState: string }) {
+  if (!snapshot) {
+    const waitingForSnapshot = statsState === "stats connecting" || statsState === "stats live" || statsState === "stats reconnecting";
+    return (
+      <section className="panel wide statsUnavailable">
+        <div className="emptyState">
+          <strong>{waitingForSnapshot ? "Stats-service подключен" : "Stats-service недоступен"}</strong>
+          <span>{waitingForSnapshot ? "Ждем первый snapshot статистики." : "Реальная статистика строится только из отдельного сервиса статистики. Демо-расчеты из локальных seed-данных отключены."}</span>
+          <span className="apiState">{statsState}</span>
         </div>
       </section>
+    );
+  }
+  const { totals } = snapshot;
+  return (
+    <div className="pageGrid">
+      <section className="panel wide statsOverviewPanel">
+        <div className="panelHeader">
+          <h2>Реальная статистика</h2>
+          <span>{statsState} · {snapshot.source}</span>
+        </div>
+        <div className="stats">
+          <Metric label="всего сообщений" value={totals.messages.toLocaleString()} />
+          <Metric label="обработано" value={totals.processed.toLocaleString()} />
+          <Metric label="успешно" value={totals.success.toLocaleString()} tone="success" />
+          <Metric label="ошибки" value={totals.failed.toLocaleString()} tone="danger" />
+          <Metric label="успешность" value={formatRate(totals.successRate)} tone={totals.successRate !== null && totals.successRate >= 0.9 ? "success" : undefined} />
+          <Metric label="в очереди DB" value={totals.pending.toLocaleString()} />
+          <Metric label="очередь RabbitMQ" value={totals.queueDepth >= 0 ? totals.queueDepth.toLocaleString() : "Нет данных"} />
+          <Metric label="активные" value={String(totals.active)} />
+          <Metric label="p95 enqueue" value={totals.p95DispatchMs > 0 ? `${totals.p95DispatchMs} ms` : "pending"} />
+        </div>
+      </section>
+      <RealtimeDeliveryCharts snapshot={snapshot} />
       <section className="panel wide">
-        <div className="panelHeader"><h2>Качество каналов</h2><span>{channels.filter((channel) => channel.enabled).length} включены</span></div>
+        <div className="panelHeader"><h2>Качество каналов</h2><span>{snapshot.channels.length} каналов</span></div>
         <div className="barChart">
-          {channels.map((channel) => {
-            const rate = channel.deliveryTotal && channel.deliverySuccessRate !== null && channel.deliverySuccessRate !== undefined ? channel.deliverySuccessRate : 0;
-            return <div key={channel.code}><span>{channel.code}</span><i style={{ width: `${Math.max(2, rate * 100)}%` }} /><strong>{formatChannelSuccess(channel)}</strong></div>;
+          {snapshot.channels.map((stat) => {
+            const hasStats = stat.successRate !== null && stat.total > 0;
+            const rate = hasStats ? Math.min(1, Math.max(0, stat.successRate ?? 0)) : 0;
+            const fillWidth = hasStats && rate > 0 ? `${Math.max(2, Math.round(rate * 100))}%` : "0%";
+            return (
+              <div key={stat.code} className={`qualityRow${hasStats ? "" : " empty"}`} data-testid={`channel-quality-${stat.code}`}>
+                <span className="qualityName">{stat.code}</span>
+                <span className="qualityTrack" aria-hidden="true"><i className="qualityFill" style={{ width: fillWidth }} /></span>
+                <strong>{hasStats ? `${formatRate(rate)} · ${stat.total.toLocaleString()}` : "Нет данных"}</strong>
+              </div>
+            );
           })}
         </div>
       </section>
+      <ServiceMailingMetrics snapshot={snapshot} />
     </div>
   );
+}
+
+function RealtimeDeliveryCharts({ snapshot }: { snapshot: StatsSnapshot }) {
+  const points = snapshot.realtime;
+  const last = points[points.length - 1] ?? { sent: 0, failed: 0, bucket: "now" };
+  return (
+    <section className="panel wide realtimePanel">
+      <div className="panelHeader">
+        <h2>Отправки / сбои real-time</h2>
+        <span>{points.length} точек · {formatDate(snapshot.generatedAt)}</span>
+      </div>
+      <div className="realtimeGrid">
+        <SparkBars
+          label="Отправлено"
+          value={last.sent.toLocaleString()}
+          testId="realtime-sent-last"
+          tone="success"
+          values={points.map((point) => point.sent)}
+        />
+        <SparkBars
+          label="Сбои"
+          value={last.failed.toLocaleString()}
+          testId="realtime-failed-last"
+          tone="danger"
+          values={points.map((point) => point.failed)}
+        />
+        <SparkBars
+          label="Очередь"
+          value={snapshot.totals.queueDepth >= 0 ? snapshot.totals.queueDepth.toLocaleString() : "Нет данных"}
+          tone="queue"
+          values={points.map(() => Math.max(0, snapshot.totals.queueDepth))}
+        />
+        <SparkBars
+          label="Успешность"
+          value={formatRate(snapshot.totals.successRate)}
+          tone="rate"
+          values={points.map((point) => {
+            const resolved = point.sent + point.failed;
+            return resolved > 0 ? Math.round((point.sent / resolved) * 100) : 0;
+          })}
+        />
+      </div>
+    </section>
+  );
+}
+
+function SparkBars({ label, value, values, tone, testId }: { label: string; value: string; values: number[]; tone: string; testId?: string }) {
+  const max = Math.max(1, ...values);
+  return (
+    <article className={`sparkCard ${tone}`}>
+      <div className="sparkTop">
+        <span>{label}</span>
+        <strong data-testid={testId}>{value}</strong>
+      </div>
+      <div className="sparkBars" aria-label={label}>
+        {values.map((value, index) => (
+          <i key={`${label}-${index}`} style={{ height: `${Math.max(4, Math.round((value / max) * 100))}%` }} />
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function ServiceMailingMetrics({ snapshot }: { snapshot: StatsSnapshot }) {
+  const { totals } = snapshot;
+  const degradedChannels = snapshot.channels.filter((stat) => stat.successRate !== null && stat.successRate < 0.9).length;
+  const queuedRatio = totals.messages > 0 ? totals.pending / totals.messages : null;
+  const avgLatency = average(snapshot.channels.map((channel) => channel.averageLatencyMs).filter((value): value is number => value !== null));
+  return (
+    <section className="panel wide serviceMetricsPanel">
+      <div className="panelHeader"><h2>Метрики рассылок и сервисов</h2><span>операционный срез</span></div>
+      <div className="serviceMetricGrid">
+        <Metric label="каналов ниже 90%" value={String(degradedChannels)} tone={degradedChannels > 0 ? "danger" : "success"} />
+        <Metric label="доля очереди" value={formatRate(queuedRatio)} />
+        <Metric label="failure rate" value={formatRate(totals.failedRate)} tone={totals.failedRate !== null && totals.failedRate > 0.05 ? "danger" : undefined} />
+        <Metric label="avg delivery latency" value={avgLatency === null ? "Нет данных" : `${Math.round(avgLatency)} ms`} />
+      </div>
+    </section>
+  );
+}
+
+function average(values: number[]) {
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function Managers({ role, managers, onAdd }: { role: Role; managers: Manager[]; onAdd: (email: string, role: Role) => void }) {
@@ -1938,6 +2155,9 @@ function Managers({ role, managers, onAdd }: { role: Role; managers: Manager[]; 
 function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: ServiceHealth[]; onRefresh: () => Promise<ServiceHealth[]> }) {
   const [refreshing, setRefreshing] = useState(false);
   const [workerStats, setWorkerStats] = useState<WorkerStats | null>(null);
+  const [workerAction, setWorkerAction] = useState(false);
+  const [workerMinBound, setWorkerMinBound] = useState(1);
+  const [workerMaxBound, setWorkerMaxBound] = useState(1);
   const onRefreshRef = useRef(onRefresh);
   const readyCount = checks.filter((check) => check.status === "ready").length;
   const downCount = checks.filter((check) => check.status === "down").length;
@@ -1970,7 +2190,32 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
     return () => window.clearInterval(timer);
   }, []);
 
-  const workerFill = workerStats ? Math.round((workerStats.activeWorkers / workerStats.maxWorkers) * 100) : 0;
+  useEffect(() => {
+    if (!workerStats) return;
+    setWorkerMinBound(workerStats.minReplicas);
+    setWorkerMaxBound(workerStats.maxReplicas);
+  }, [workerStats?.minReplicas, workerStats?.maxReplicas]);
+
+  async function saveWorkerBounds() {
+    if (!workerStats || workerAction) return;
+    const minReplicas = Math.max(1, Math.floor(workerMinBound));
+    const maxReplicas = Math.max(1, Math.floor(workerMaxBound));
+    if (minReplicas > maxReplicas) return;
+    setWorkerAction(true);
+    try {
+      const updated = await updateWorkerBounds(minReplicas, maxReplicas);
+      if (updated) setWorkerStats(updated);
+    } finally {
+      setWorkerAction(false);
+    }
+  }
+
+  const workerCapacity = workerStats ? Math.max(1, workerStats.maxReplicas) : 1;
+  const workerFill = workerStats ? Math.round((workerStats.replicas / workerCapacity) * 100) : 0;
+  const canSaveWorkerBounds = Boolean(workerStats && workerStats.controlEnabled && !workerAction && workerMinBound >= 1 && workerMaxBound >= workerMinBound);
+  const workerControlLabel = workerStats?.controlEnabled ? `${workerStats.autoscaler} · ${workerStats.controlMode}` : "только просмотр · CLI";
+  const workerBoundsDirty = Boolean(workerStats && (workerMinBound !== workerStats.minReplicas || workerMaxBound !== workerStats.maxReplicas));
+  const workerScaleDownPending = Boolean(workerStats && workerStats.replicas > workerStats.maxReplicas);
 
   return (
     <div className="pageGrid">
@@ -1979,9 +2224,9 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
         {workerStats ? (
           <div className="workerStatsGrid">
             <div className="workerStatCard workerStatMain">
-              <span className="workerStatLabel">Активных воркеров</span>
-              <strong className="workerStatValue">{workerStats.activeWorkers}</strong>
-              <span className="workerStatSub">из {workerStats.minWorkers}–{workerStats.maxWorkers}</span>
+              <span className="workerStatLabel">Контейнеров sender-worker</span>
+              <strong className="workerStatValue">{workerStats.replicas}</strong>
+              <span className="workerStatSub">{workerStats.replicas} готово · HPA цель {workerStats.desiredReplicas}</span>
               <div className="workerBar">
                 <div className="workerBarFill" style={{ width: `${workerFill}%` }} />
               </div>
@@ -1991,10 +2236,21 @@ function Health({ events, checks, onRefresh }: { events: SystemEvent[]; checks: 
               <strong className="workerStatValue">{workerStats.queueDepth >= 0 ? workerStats.queueDepth.toLocaleString() : "—"}</strong>
               <span className="workerStatSub">message.send.request</span>
             </div>
-            <div className="workerStatCard">
-              <span className="workerStatLabel">Масштабирование</span>
-              <strong className="workerStatValue">{workerStats.minWorkers}–{workerStats.maxWorkers}</strong>
-              <span className="workerStatSub">мин–макс воркеров</span>
+            <div className="workerControls">
+              <label>
+                <span>Мин</span>
+                <input aria-label="Минимум контейнеров" type="number" min={1} value={workerMinBound} onChange={(event) => setWorkerMinBound(Number(event.target.value))} disabled={!workerStats.controlEnabled || workerAction} />
+              </label>
+              <label>
+                <span>Макс</span>
+                <input aria-label="Максимум контейнеров" type="number" min={1} value={workerMaxBound} onChange={(event) => setWorkerMaxBound(Number(event.target.value))} disabled={!workerStats.controlEnabled || workerAction} />
+              </label>
+              <button onClick={() => void saveWorkerBounds()} disabled={!canSaveWorkerBounds}>Сохранить</button>
+              <small>
+                HPA сейчас: {workerStats.minReplicas}-{workerStats.maxReplicas} · {workerControlLabel}
+                {workerBoundsDirty ? " · не сохранено" : ""}
+                {workerScaleDownPending ? " · уменьшение в процессе" : ""}
+              </small>
             </div>
           </div>
         ) : (
@@ -2098,8 +2354,36 @@ function buildError(campaign: Campaign): ActionableError {
     title: "Есть неуспешные отправки",
     description: `Кампания ${campaign.name} получила ошибки доставки в одном или нескольких каналах.`,
     impact: `Затронуто ${campaign.failed.toLocaleString()} сообщений. Остальные отправки продолжаются.`,
-    actions: currentError.actions,
+    actions: [
+      { code: "retry", label: "Повторить" },
+      { code: "switch_channel", label: "Сменить канал" },
+      { code: "cancel_campaign", label: "Отменить" },
+    ],
   };
+}
+
+function emptyActionableError(): ActionableError {
+  return {
+    title: "Нет активных ошибок",
+    description: "",
+    impact: "",
+    actions: [
+      { code: "retry", label: "Повторить" },
+      { code: "switch_channel", label: "Сменить канал" },
+      { code: "cancel_campaign", label: "Отменить" },
+    ],
+  };
+}
+
+function replaceCampaignErrorGroups(existing: ErrorGroup[], campaignId: string, groups: ErrorGroup[]) {
+  return [
+    ...groups.filter(isRealErrorGroup),
+    ...existing.filter((group) => group.campaignId !== campaignId && isRealErrorGroup(group)),
+  ];
+}
+
+function isRealErrorGroup(group: ErrorGroup) {
+  return !(group.id === "max-stub-failed" && group.errorCode === "stub_failed" && group.errorMessage === "max stub failed");
 }
 
 function initialHealthChecks(): ServiceHealth[] {
@@ -2168,7 +2452,6 @@ function formatLatency(value: number) {
 }
 
 function formatP95Dispatch(campaign: Campaign) {
-  if (campaign.p95DispatchMs === 1) return "<1 ms";
   if (campaign.p95DispatchMs > 0) return `${campaign.p95DispatchMs} ms`;
   if (campaign.status === "created") return "pending";
   if (campaign.status === "running" || campaign.status === "retrying") return "measuring";
@@ -2205,6 +2488,30 @@ function subtitleFor(screen: Screen) {
     logs: "Аудит и системные события.",
   };
   return subtitles[screen];
+}
+
+const screenPaths: Record<Screen, string> = {
+  dashboard: "/",
+  campaigns: "/campaigns",
+  create: "/create",
+  templates: "/templates",
+  channels: "/channels",
+  deliveries: "/deliveries",
+  stats: "/stats",
+  managers: "/managers",
+  health: "/health",
+  logs: "/logs",
+};
+
+function pathForScreen(screen: Screen) {
+  return screenPaths[screen];
+}
+
+function screenFromLocation(): Screen {
+  if (typeof window === "undefined") return "dashboard";
+  const normalizedPath = window.location.pathname.replace(/\/+$/, "") || "/";
+  const match = (Object.entries(screenPaths) as [Screen, string][]).find(([, path]) => path === normalizedPath);
+  return match?.[0] ?? "dashboard";
 }
 
 type IconName = "dashboard" | "campaign" | "plus" | "template" | "channel" | "table" | "chart" | "users" | "pulse" | "log" | "logout" | "login" | "alert" | "retry" | "switch" | "stop" | "play" | "save" | "cancel" | "archive";

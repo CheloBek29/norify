@@ -26,33 +26,35 @@ import (
 )
 
 type Campaign struct {
-	ID               string             `json:"id"`
-	Name             string             `json:"name"`
-	TemplateID       string             `json:"template_id"`
-	TemplateName     string             `json:"template_name"`
-	Status           string             `json:"status"`
-	Filters          json.RawMessage    `json:"filters"`
-	SelectedChannels []string           `json:"selected_channels"`
-	TotalRecipients  int                `json:"total_recipients"`
-	TotalMessages    int                `json:"total_messages"`
-	SentCount        int                `json:"sent_count"`
-	SuccessCount     int                `json:"success_count"`
-	FailedCount      int                `json:"failed_count"`
-	CancelledCount   int                `json:"cancelled_count"`
-	P95DispatchMs    int                `json:"p95_dispatch_ms"`
-	CreatedAt        time.Time          `json:"created_at"`
-	StartedAt        *time.Time         `json:"started_at,omitempty"`
-	FinishedAt       *time.Time         `json:"finished_at,omitempty"`
-	ArchivedAt       *time.Time         `json:"archived_at,omitempty"`
-	Snapshot         campaigns.Snapshot `json:"snapshot"`
+	ID                 string                        `json:"id"`
+	Name               string                        `json:"name"`
+	TemplateID         string                        `json:"template_id"`
+	TemplateName       string                        `json:"template_name"`
+	Status             string                        `json:"status"`
+	Filters            json.RawMessage               `json:"filters"`
+	SelectedChannels   []string                      `json:"selected_channels"`
+	SpecificRecipients []contracts.CampaignRecipient `json:"-"`
+	TotalRecipients    int                           `json:"total_recipients"`
+	TotalMessages      int                           `json:"total_messages"`
+	SentCount          int                           `json:"sent_count"`
+	SuccessCount       int                           `json:"success_count"`
+	FailedCount        int                           `json:"failed_count"`
+	CancelledCount     int                           `json:"cancelled_count"`
+	P95DispatchMs      int                           `json:"p95_dispatch_ms"`
+	CreatedAt          time.Time                     `json:"created_at"`
+	StartedAt          *time.Time                    `json:"started_at,omitempty"`
+	FinishedAt         *time.Time                    `json:"finished_at,omitempty"`
+	ArchivedAt         *time.Time                    `json:"archived_at,omitempty"`
+	Snapshot           campaigns.Snapshot            `json:"snapshot"`
 }
 
 type createCampaignRequest struct {
-	Name             string          `json:"name"`
-	TemplateID       string          `json:"template_id"`
-	Filters          json.RawMessage `json:"filters"`
-	SelectedChannels []string        `json:"selected_channels"`
-	TotalRecipients  int             `json:"total_recipients"`
+	Name               string                        `json:"name"`
+	TemplateID         string                        `json:"template_id"`
+	Filters            json.RawMessage               `json:"filters"`
+	SelectedChannels   []string                      `json:"selected_channels"`
+	SpecificRecipients []contracts.CampaignRecipient `json:"specific_recipients,omitempty"`
+	TotalRecipients    int                           `json:"total_recipients"`
 }
 
 type switchChannelRequest struct {
@@ -177,7 +179,7 @@ func listCampaigns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(r.Context(), `
-		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels,
+		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels, c.specific_recipients,
 		       c.total_recipients, c.total_messages, c.sent_count, c.success_count, c.failed_count, c.cancelled_count,
 		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at, c.archived_at
 		FROM campaigns c
@@ -215,7 +217,10 @@ func createCampaign(w http.ResponseWriter, r *http.Request) {
 		httpapi.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "name_template_and_channels_required"})
 		return
 	}
-	if req.TotalRecipients <= 0 {
+	specificRecipients, specificTotalRecipients, specificTotalMessages := prepareSpecificRecipients(req)
+	if len(specificRecipients) > 0 {
+		req.TotalRecipients = specificTotalRecipients
+	} else if req.TotalRecipients <= 0 {
 		count, err := countAudience(r.Context(), req.Filters)
 		if err != nil {
 			httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -228,10 +233,15 @@ func createCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 	id := newID("cmp")
 	selected, _ := json.Marshal(req.SelectedChannels)
+	specific, _ := json.Marshal(specificRecipients)
+	totalMessages := campaigns.TotalMessages(req.TotalRecipients, req.SelectedChannels)
+	if len(specificRecipients) > 0 {
+		totalMessages = specificTotalMessages
+	}
 	_, err := db.Exec(r.Context(), `
-		INSERT INTO campaigns (id, name, template_id, status, filters, selected_channels, total_recipients, total_messages)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		id, req.Name, req.TemplateID, campaigns.StatusCreated, req.Filters, selected, req.TotalRecipients, campaigns.TotalMessages(req.TotalRecipients, req.SelectedChannels))
+		INSERT INTO campaigns (id, name, template_id, status, filters, selected_channels, specific_recipients, total_recipients, total_messages)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		id, req.Name, req.TemplateID, campaigns.StatusCreated, req.Filters, selected, specific, req.TotalRecipients, totalMessages)
 	if err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -306,7 +316,7 @@ func dispatchMetrics(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	_, err := db.Exec(r.Context(), `
 		UPDATE campaigns
-		SET p95_dispatch_ms = $2, updated_at = now()
+		SET p95_dispatch_ms = GREATEST(p95_dispatch_ms, $2), updated_at = now()
 		WHERE id = $1`, id, metrics.P95DispatchMs)
 	if err != nil {
 		httpapi.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -358,13 +368,13 @@ func transitionCampaignToRunning(ctx context.Context, id string, startedAt time.
 			FROM candidate
 			WHERE c.id = candidate.id
 			RETURNING candidate.status AS previous_status, candidate.started_at AS previous_started_at,
-			          c.id, c.name, c.template_id, c.status, c.filters, c.selected_channels,
+			          c.id, c.name, c.template_id, c.status, c.filters, c.selected_channels, c.specific_recipients,
 			          c.total_recipients, c.total_messages, c.sent_count, c.success_count,
 			          c.failed_count, c.cancelled_count, c.p95_dispatch_ms, c.created_at,
 			          c.started_at, c.finished_at, c.archived_at
 		)
 		SELECT u.previous_status, u.previous_started_at,
-		       u.id, u.name, u.template_id, COALESCE(t.name, ''), u.status, u.filters, u.selected_channels,
+		       u.id, u.name, u.template_id, COALESCE(t.name, ''), u.status, u.filters, u.selected_channels, u.specific_recipients,
 		       u.total_recipients, u.total_messages, u.sent_count, u.success_count, u.failed_count, u.cancelled_count,
 		       u.p95_dispatch_ms, u.created_at, u.started_at, u.finished_at, u.archived_at
 		FROM updated u
@@ -373,10 +383,11 @@ func transitionCampaignToRunning(ctx context.Context, id string, startedAt time.
 	var previous rollbackStartState
 	var campaign Campaign
 	var selected []byte
+	var specific []byte
 	err := row.Scan(
 		&previous.Status, &previous.StartedAt,
 		&campaign.ID, &campaign.Name, &campaign.TemplateID, &campaign.TemplateName, &campaign.Status,
-		&campaign.Filters, &selected, &campaign.TotalRecipients, &campaign.TotalMessages,
+		&campaign.Filters, &selected, &specific, &campaign.TotalRecipients, &campaign.TotalMessages,
 		&campaign.SentCount, &campaign.SuccessCount, &campaign.FailedCount, &campaign.CancelledCount,
 		&campaign.P95DispatchMs, &campaign.CreatedAt, &campaign.StartedAt, &campaign.FinishedAt, &campaign.ArchivedAt,
 	)
@@ -390,6 +401,7 @@ func transitionCampaignToRunning(ctx context.Context, id string, startedAt time.
 		return Campaign{}, rollbackStartState{}, false, err
 	}
 	_ = json.Unmarshal(selected, &campaign.SelectedChannels)
+	_ = json.Unmarshal(specific, &campaign.SpecificRecipients)
 	progress := campaigns.Progress{
 		CampaignID: campaign.ID, TotalMessages: campaign.TotalMessages, Success: campaign.SuccessCount,
 		Failed: campaign.FailedCount, Cancelled: campaign.CancelledCount, IsCancelled: campaign.Status == campaigns.StatusCancelled,
@@ -409,6 +421,29 @@ func canStartCampaign(status string) bool {
 
 func rollbackStateAfterStartFailure(campaign Campaign) rollbackStartState {
 	return rollbackStartState{Status: campaign.Status, StartedAt: campaign.StartedAt}
+}
+
+func prepareSpecificRecipients(req createCampaignRequest) ([]contracts.CampaignRecipient, int, int) {
+	if len(req.SpecificRecipients) == 0 {
+		return nil, 0, 0
+	}
+	seen := map[string]bool{}
+	recipients := make([]contracts.CampaignRecipient, 0, len(req.SpecificRecipients))
+	totalMessages := 0
+	for _, recipient := range req.SpecificRecipients {
+		userID := strings.TrimSpace(recipient.UserID)
+		if userID == "" || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		channels := unique(recipient.Channels)
+		if len(channels) == 0 {
+			channels = unique(req.SelectedChannels)
+		}
+		recipients = append(recipients, contracts.CampaignRecipient{UserID: userID, Channels: channels})
+		totalMessages += len(channels)
+	}
+	return recipients, len(recipients), totalMessages
 }
 
 func stopCampaign(w http.ResponseWriter, r *http.Request, id string) {
@@ -960,20 +995,21 @@ func publishDispatch(ctx context.Context, campaign Campaign) error {
 	body := ""
 	_ = db.QueryRow(ctx, `SELECT body FROM templates WHERE id = $1`, campaign.TemplateID).Scan(&body)
 	req := contracts.CampaignDispatchRequest{
-		CampaignID:       campaign.ID,
-		TemplateID:       campaign.TemplateID,
-		MessageBody:      body,
-		TotalRecipients:  campaign.TotalRecipients,
-		SelectedChannels: campaign.SelectedChannels,
-		BatchSize:        appruntime.EnvInt("DISPATCH_BATCH_SIZE", campaigns.DefaultDispatchBatchSize),
-		RequestedAt:      time.Now().UTC().Format(time.RFC3339),
+		CampaignID:         campaign.ID,
+		TemplateID:         campaign.TemplateID,
+		MessageBody:        body,
+		TotalRecipients:    campaign.TotalRecipients,
+		SelectedChannels:   campaign.SelectedChannels,
+		SpecificRecipients: campaign.SpecificRecipients,
+		BatchSize:          appruntime.EnvInt("DISPATCH_BATCH_SIZE", campaigns.DefaultDispatchBatchSize),
+		RequestedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
 	return publishJSON(ctx, "publish-campaign-dispatch", "", appruntime.QueueCampaignDispatch, req)
 }
 
 func getCampaign(ctx context.Context, id string) (Campaign, error) {
 	row := db.QueryRow(ctx, `
-		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels,
+		SELECT c.id, c.name, c.template_id, COALESCE(t.name, ''), c.status, c.filters, c.selected_channels, c.specific_recipients,
 		       c.total_recipients, c.total_messages, c.sent_count, c.success_count, c.failed_count, c.cancelled_count,
 		       c.p95_dispatch_ms, c.created_at, c.started_at, c.finished_at, c.archived_at
 		FROM campaigns c
@@ -985,15 +1021,17 @@ func getCampaign(ctx context.Context, id string) (Campaign, error) {
 func scanCampaign(row pgx.Row) (Campaign, error) {
 	var campaign Campaign
 	var selected []byte
+	var specific []byte
 	if err := row.Scan(
 		&campaign.ID, &campaign.Name, &campaign.TemplateID, &campaign.TemplateName, &campaign.Status,
-		&campaign.Filters, &selected, &campaign.TotalRecipients, &campaign.TotalMessages,
+		&campaign.Filters, &selected, &specific, &campaign.TotalRecipients, &campaign.TotalMessages,
 		&campaign.SentCount, &campaign.SuccessCount, &campaign.FailedCount, &campaign.CancelledCount,
 		&campaign.P95DispatchMs, &campaign.CreatedAt, &campaign.StartedAt, &campaign.FinishedAt, &campaign.ArchivedAt,
 	); err != nil {
 		return Campaign{}, err
 	}
 	_ = json.Unmarshal(selected, &campaign.SelectedChannels)
+	_ = json.Unmarshal(specific, &campaign.SpecificRecipients)
 	progress := campaigns.Progress{
 		CampaignID: campaign.ID, TotalMessages: campaign.TotalMessages, Success: campaign.SuccessCount,
 		Failed: campaign.FailedCount, Cancelled: campaign.CancelledCount, IsCancelled: campaign.Status == campaigns.StatusCancelled,
@@ -1013,6 +1051,7 @@ func ensureSchema(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS p95_dispatch_ms int NOT NULL DEFAULT 0;
 		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+		ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS specific_recipients jsonb NOT NULL DEFAULT '[]';
 		CREATE INDEX IF NOT EXISTS idx_campaigns_active_created_at ON campaigns(created_at DESC) WHERE archived_at IS NULL;
 		ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_template_id_fkey;`)
 	return err

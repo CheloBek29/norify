@@ -40,12 +40,30 @@ spec:
   template:
     metadata: {labels: {app: rabbitmq}}
     spec:
+      securityContext:
+        fsGroup: 101
+      initContainers:
+        - name: rabbitmq-data-permissions
+          image: rabbitmq:3.13-management-alpine
+          command: ["sh", "-c", "chown -R 100:101 /var/lib/rabbitmq && chmod 1777 /var/lib/rabbitmq"]
+          volumeMounts:
+            - {name: rabbitmq-data, mountPath: /var/lib/rabbitmq}
       containers:
         - name: rabbitmq
           image: rabbitmq:3.13-management-alpine
           ports: [{containerPort: 5672}, {containerPort: 15672}]
+          env:
+            - {name: RABBITMQ_ERLANG_COOKIE, value: norify-local-cookie}
+          volumeMounts:
+            - {name: rabbitmq-data, mountPath: /var/lib/rabbitmq}
           readinessProbe:
             exec: {command: ["rabbitmq-diagnostics", "ping"]}
+            initialDelaySeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 12
+      volumes:
+        - name: rabbitmq-data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -84,4 +102,3 @@ metadata:
 spec:
   selector: {app: redis}
   ports: [{port: 6379, targetPort: 6379}]
-

@@ -11,7 +11,8 @@ spec:
     spec:
       containers:
         - name: service
-          image: norify/auth-service:latest
+          image: norify-auth-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom:
             - configMapRef: {name: norify-config}
@@ -41,7 +42,8 @@ spec:
     spec:
       containers:
         - name: service
-          image: norify/user-service:latest
+          image: norify-user-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom: [{configMapRef: {name: norify-config}}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
@@ -67,13 +69,32 @@ spec:
   template:
     metadata: {labels: {app: sender-worker}}
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
+        - name: wait-rabbitmq
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: worker
-          image: norify/sender-worker:latest
+          image: norify-sender-worker:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom:
             - configMapRef: {name: norify-config}
             - secretRef: {name: norify-secret}
+          env:
+            - {name: WORKER_PREFETCH, value: "1"}
+            - {name: WORKER_MIN_POOL, value: "1"}
+            - {name: WORKER_MAX_POOL, value: "1"}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
           readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
 ---
@@ -96,6 +117,53 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sender-worker
+  namespace: norify
+spec:
+  selector: {app: sender-worker}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ops-gateway
+  namespace: norify
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sender-worker-scaler
+  namespace: norify
+rules:
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    resourceNames: ["sender-worker"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ops-gateway-sender-worker-scaler
+  namespace: norify
+subjects:
+  - kind: ServiceAccount
+    name: ops-gateway
+    namespace: norify
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sender-worker-scaler
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -108,9 +176,14 @@ spec:
   template:
     metadata: {labels: {app: template-service}}
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
       containers:
         - name: service
-          image: norify/template-service:latest
+          image: norify-template-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom: [{configMapRef: {name: norify-config}}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
@@ -136,9 +209,14 @@ spec:
   template:
     metadata: {labels: {app: channel-service}}
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
       containers:
         - name: service
-          image: norify/channel-service:latest
+          image: norify-channel-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom: [{configMapRef: {name: norify-config}}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
@@ -164,9 +242,17 @@ spec:
   template:
     metadata: {labels: {app: campaign-service}}
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
+        - name: wait-rabbitmq
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
-          image: norify/campaign-service:latest
+          image: norify-campaign-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom: [{configMapRef: {name: norify-config}}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
@@ -192,9 +278,14 @@ spec:
   template:
     metadata: {labels: {app: dispatcher-service}}
     spec:
+      initContainers:
+        - name: wait-rabbitmq
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
-          image: norify/dispatcher-service:latest
+          image: norify-dispatcher-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           envFrom: [{configMapRef: {name: norify-config}}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
@@ -222,7 +313,8 @@ spec:
     spec:
       containers:
         - name: service
-          image: norify/notification-error-service:latest
+          image: norify-notification-error-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
           readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
@@ -239,29 +331,73 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: status-service
+  name: stats-service
   namespace: norify
 spec:
   replicas: 2
-  selector: {matchLabels: {app: status-service}}
+  selector: {matchLabels: {app: stats-service}}
   template:
-    metadata: {labels: {app: status-service}}
+    metadata: {labels: {app: stats-service}}
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U norify -d norify; do sleep 2; done"]
+        - name: wait-rabbitmq
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z rabbitmq 5672; do sleep 2; done"]
       containers:
         - name: service
-          image: norify/status-service:latest
+          image: norify-stats-service:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
-          envFrom: [{configMapRef: {name: norify-config}}]
+          envFrom:
+            - configMapRef: {name: norify-config}
+            - secretRef: {name: norify-secret}
           livenessProbe: {httpGet: {path: /health/live, port: 8080}}
           readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: status-service
+  name: stats-service
   namespace: norify
 spec:
-  selector: {app: status-service}
+  selector: {app: stats-service}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ops-gateway
+  namespace: norify
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: ops-gateway}}
+  template:
+    metadata: {labels: {app: ops-gateway}}
+    spec:
+      serviceAccountName: ops-gateway
+      containers:
+        - name: service
+          image: norify-ops-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: norify-config}}]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ops-gateway
+  namespace: norify
+spec:
+  selector: {app: ops-gateway}
   ports: [{port: 8080, targetPort: 8080}]
 ---
 apiVersion: apps/v1
@@ -277,7 +413,8 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: norify/frontend:latest
+          image: norify-frontend:latest
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 80}]
 ---
 apiVersion: v1

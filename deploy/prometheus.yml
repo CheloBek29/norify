@@ -12,5 +12,5 @@ scrape_configs:
           - dispatcher-service:8080
           - sender-worker:8080
           - notification-error-service:8080
-          - status-service:8080
-
+          - ops-gateway:8080
+          - stats-service:8080

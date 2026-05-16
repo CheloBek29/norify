@@ -27,6 +27,33 @@ class MockWebSocket {
   }
 }
 
+class MockEventSource {
+  static instances: MockEventSource[] = [];
+  listeners = new Map<string, ((event: MessageEvent<string>) => void)[]>();
+  onopen: null | (() => void) = null;
+  onmessage: null | ((event: MessageEvent<string>) => void) = null;
+  onerror: null | (() => void) = null;
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    MockEventSource.instances.push(this);
+    window.setTimeout(() => this.onopen?.(), 0);
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<string>) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close() {}
+
+  emit(type: string, data: unknown) {
+    const event = { data: JSON.stringify(data) } as MessageEvent<string>;
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    if (type === "message") this.onmessage?.(event);
+  }
+}
+
 function login() {
   fireEvent.click(screen.getByRole("button", { name: "Продолжить" }));
 }
@@ -62,6 +89,80 @@ function campaignPayload(overrides: Record<string, unknown>) {
   };
 }
 
+function statsPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    generated_at: "2026-05-16T05:40:00Z",
+    source: "postgres",
+    totals: {
+      messages: 100,
+      processed: 80,
+      success: 72,
+      failed: 6,
+      cancelled: 2,
+      pending: 20,
+      active: 1,
+      queue_depth: 7,
+      success_rate: 0.9,
+      failed_rate: 0.075,
+      p95_dispatch_ms: 42,
+    },
+    channels: [
+      { code: "email", total: 50, sent: 47, failed: 3, queued: 0, cancelled: 0, success_rate: 0.94, failure_rate: 0.06, average_attempt: 1.2, average_latency_ms: 320 },
+      { code: "sms", total: 30, sent: 25, failed: 3, queued: 2, cancelled: 0, success_rate: 0.89, failure_rate: 0.11, average_attempt: 1.8, average_latency_ms: 850 },
+    ],
+    realtime: [
+      { bucket: "08:39", sent: 10, failed: 1 },
+      { bucket: "08:40", sent: 14, failed: 2 },
+    ],
+    ...overrides,
+  };
+}
+
+const backendErrorGroup = {
+  id: "provider-timeout-max",
+  campaign_id: "cmp-spring",
+  channel_code: "max",
+  error_code: "provider_timeout",
+  error_message: "provider timeout: HTTP 504",
+  failed_count: 173,
+  max_attempt: 3,
+  first_seen_at: "2026-05-16T06:40:00Z",
+  last_seen_at: "2026-05-16T06:42:00Z",
+  impact: "Затронуто 173 сообщений. Основная очередь продолжает обработку.",
+  recommended_actions: [
+    { code: "retry", label: "Повторить группу" },
+    { code: "switch_channel", label: "Вставить через другой канал" },
+    { code: "cancel_group", label: "Закрыть группу" },
+  ],
+};
+
+function mockCampaignBackendWithErrorGroups(groups = [backendErrorGroup]) {
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/campaigns")) {
+      return Promise.resolve(new Response(JSON.stringify([campaignPayload({
+        id: "cmp-spring",
+        selected_channels: ["email", "max", "custom_app"],
+        failed_count: 173,
+      })]), { status: 200 }));
+    }
+    if (url.endsWith("/campaigns/cmp-spring/error-groups")) {
+      return Promise.resolve(new Response(JSON.stringify(groups), { status: 200 }));
+    }
+    return Promise.reject(new Error("backend_offline"));
+  }));
+}
+
+function mockStatsFetch(snapshot = statsPayload()) {
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/stats/overview")) {
+      return Promise.resolve(new Response(JSON.stringify(snapshot), { status: 200 }));
+    }
+    return Promise.reject(new Error("backend_offline"));
+  }));
+}
+
 describe("App", () => {
   afterEach(() => {
     cleanup();
@@ -70,6 +171,7 @@ describe("App", () => {
 
   beforeEach(() => {
     MockWebSocket.instances = [];
+    window.history.replaceState(null, "", "/");
     const storage = new Map<string, string>();
     Object.defineProperty(window, "localStorage", {
       configurable: true,
@@ -82,6 +184,7 @@ describe("App", () => {
     vi.restoreAllMocks();
     vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("backend_offline"))));
     vi.stubGlobal("WebSocket", MockWebSocket);
+    vi.stubGlobal("EventSource", undefined);
   });
 
   it("renders login screen", () => {
@@ -126,31 +229,91 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Новая кампания/i })).toBeTruthy();
   });
 
+  it("keeps the current screen after a browser refresh", async () => {
+    const { unmount } = render(<App />);
+    login();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Каналы" }));
+
+    expect(await screen.findByRole("heading", { name: "Каналы" })).toBeTruthy();
+    expect(window.location.pathname).toBe("/channels");
+
+    unmount();
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Каналы" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Каналы" }).className).toContain("active");
+  });
+
   it("shows realtime error groups and resolves one without stopping the campaign", async () => {
+    mockCampaignBackendWithErrorGroups();
     render(<App />);
     login();
 
-    expect(await screen.findByText("Группы ошибок")).toBeTruthy();
-    expect(screen.getByText("Telegram adapter timeout")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Группа ошибок" })).toBeTruthy();
+    expect(screen.getByText("Max")).toBeTruthy();
+    expect(await screen.findByText("provider timeout: HTTP 504")).toBeTruthy();
+    expect(screen.getByText("provider_timeout")).toBeTruthy();
+    expect(screen.getAllByText("173").length).toBeGreaterThan(0);
     expect(screen.getByLabelText(/Альтернативный канал/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Вставить/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Вставить/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Закрыть" })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: /Вставить/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Повторить" }));
 
     const { opsSocket, request } = await lastOpsRequest();
     await act(async () => {
       opsSocket.onmessage?.({ data: JSON.stringify({
         type: "error_group.resolved",
         request_id: request.id,
-        group_id: "telegram-timeout",
-        queued: 339,
+        group_id: "provider-timeout-max",
+        queued: 173,
         campaign: campaignPayload({ failed_count: 0 }),
       }) });
     });
 
-    await waitFor(() => expect(screen.queryByText("Telegram adapter timeout")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("provider timeout: HTTP 504")).toBeNull());
     expect(screen.getByText("Нет активных групп ошибок")).toBeTruthy();
     expect(screen.getByText(/Основная отправка продолжается/i)).toBeTruthy();
+  });
+
+  it("switches a failed error group from the redesigned channel selector", async () => {
+    mockCampaignBackendWithErrorGroups();
+    render(<App />);
+    login();
+
+    const select = await screen.findByLabelText(/Альтернативный канал/i) as HTMLSelectElement;
+    expect(select.value).toBe("custom_app");
+
+    fireEvent.change(select, { target: { value: "email" } });
+
+    const { request } = await lastOpsRequest();
+    expect(request.type).toBe("error_group.action");
+    expect(request.payload.action).toBe("switch_channel");
+    expect(request.payload.group_id).toBe("provider-timeout-max");
+    expect(request.payload.to_channel).toBe("email");
+  });
+
+  it("does not render the legacy hardcoded demo error group", async () => {
+    window.localStorage.setItem("norify-error-groups", JSON.stringify([{
+      id: "max-stub-failed",
+      campaignId: "cmp-spring",
+      channelCode: "max",
+      errorCode: "stub_failed",
+      errorMessage: "max stub failed",
+      failedCount: 173,
+      maxAttempt: 3,
+      firstSeenAt: "2026-05-13T09:03:44Z",
+      lastSeenAt: "2026-05-13T09:07:12Z",
+      impact: "Затронуто 173 сообщений. Основная очередь продолжает обработку.",
+      recommendedActions: [],
+    }]));
+
+    render(<App />);
+    login();
+
+    await screen.findByRole("heading", { name: "Группа ошибок" });
+    await waitFor(() => expect(screen.queryByText("max stub failed")).toBeNull());
   });
 
   it("requires a different channel when switching a failed error group", async () => {
@@ -310,6 +473,26 @@ describe("App", () => {
     expect(request.payload.name).toBe("Моментальный запуск");
   });
 
+  it("sends selected user ids when creating a specific campaign", async () => {
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Создать" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Выбрать точечно" }));
+    fireEvent.click(await screen.findByText("user-00001"));
+    fireEvent.click(screen.getByRole("button", { name: /Применить \(1\)/ }));
+    expect(screen.queryByText(/backend dispatch не получает выбранные ID/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Запустить кампанию/i }));
+
+    const { request } = await lastOpsRequest();
+    expect(request.type).toBe("campaign.create");
+    expect(request.payload.total_recipients).toBe(1);
+    expect(request.payload.specific_recipients).toEqual([
+      { user_id: "user-00001", channels: ["email", "sms", "telegram"] },
+    ]);
+  });
+
   it("replaces the optimistic campaign with the started backend campaign", async () => {
     render(<App />);
     login();
@@ -403,6 +586,7 @@ describe("App", () => {
   });
 
   it("renders player-style campaign controls and resumes after stop", async () => {
+    mockCampaignBackendWithErrorGroups();
     render(<App />);
     login();
 
@@ -411,7 +595,7 @@ describe("App", () => {
     expect(within(controls).getByRole("button", { name: /Остановить/i })).toBeTruthy();
     expect(within(controls).getByRole("button", { name: /Отменить/i })).toBeTruthy();
     expect((within(controls).getByRole("button", { name: /Запустить/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText("Telegram adapter timeout")).toBeTruthy();
+    expect(await screen.findByText("provider timeout: HTTP 504")).toBeTruthy();
 
     fireEvent.click(within(controls).getByRole("button", { name: /Остановить/i }));
 
@@ -426,7 +610,7 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByText("stopped")).toBeTruthy());
     expect(within(controls).getByRole("button", { name: /Продолжить/i })).toBeTruthy();
-    expect(screen.getByText("Telegram adapter timeout")).toBeTruthy();
+    expect(screen.getByText("provider timeout: HTTP 504")).toBeTruthy();
     expect(screen.getByText("5,120 / 150,000")).toBeTruthy();
 
     const statusSocket = MockWebSocket.instances.find((socket) => socket.url.includes("/ws/campaigns/cmp-spring"));
@@ -581,6 +765,61 @@ describe("App", () => {
     expect(screen.getAllByText("ready").length).toBeGreaterThan(0);
   });
 
+  it("lets admins update sender worker autoscale bounds from health screen", async () => {
+    const boundsRequests: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/workers/status")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          active_workers: 3,
+          container_workers: 1,
+          min_workers: 1,
+          max_workers: 1,
+          queue_depth: 7,
+          replicas: 3,
+          desired_replicas: 3,
+          min_replicas: 2,
+          max_replicas: 8,
+          control_enabled: true,
+          control_mode: "kubernetes",
+          autoscaler: "kubernetes-hpa",
+        }), { status: 200 }));
+      }
+      if (url.endsWith("/workers/bounds")) {
+        boundsRequests.push(JSON.parse(String(init?.body)));
+        return Promise.resolve(new Response(JSON.stringify({
+          active_workers: 3,
+          container_workers: 1,
+          min_workers: 1,
+          max_workers: 1,
+          queue_depth: 7,
+          replicas: 3,
+          desired_replicas: 3,
+          min_replicas: 3,
+          max_replicas: 9,
+          control_enabled: true,
+          control_mode: "kubernetes",
+          autoscaler: "kubernetes-hpa",
+        }), { status: 200 }));
+      }
+      if (url.includes("/health/ready")) return Promise.resolve(new Response(JSON.stringify({ status: "ready" }), { status: 200 }));
+      return Promise.reject(new Error("backend_offline"));
+    }));
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Здоровье" }));
+
+    expect(await screen.findByText("3 готово · HPA цель 3")).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Минимум контейнеров"), { target: { value: "3" } });
+    fireEvent.change(await screen.findByLabelText("Максимум контейнеров"), { target: { value: "9" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Сохранить" }));
+
+    await waitFor(() => expect(boundsRequests).toEqual([{ min_replicas: 3, max_replicas: 9 }]));
+    expect((screen.getByLabelText("Минимум контейнеров") as HTMLInputElement).value).toBe("3");
+    expect((screen.getByLabelText("Максимум контейнеров") as HTMLInputElement).value).toBe("9");
+  });
+
   it("does not show a fake zero p95 before dispatch metrics arrive", async () => {
     render(<App />);
     login();
@@ -593,7 +832,7 @@ describe("App", () => {
     expect(within(row as HTMLTableRowElement).getByText("pending")).toBeTruthy();
   });
 
-  it("labels dispatch p95 as queue enqueue latency and shows sub-millisecond values clearly", async () => {
+  it("labels dispatch p95 as queue enqueue latency and shows 1ms values clearly", async () => {
     window.localStorage.setItem("norify-campaigns", JSON.stringify([{
       id: "cmp-fast-enqueue",
       name: "Быстрая постановка",
@@ -617,7 +856,7 @@ describe("App", () => {
     login();
 
     expect(await screen.findByText("p95 enqueue")).toBeTruthy();
-    expect(screen.getByText("<1 ms")).toBeTruthy();
+    expect(screen.getByText("1 ms")).toBeTruthy();
   });
 
   it("renders channel cards from delivery statistics instead of configured probability", async () => {
@@ -664,6 +903,101 @@ describe("App", () => {
     expect(screen.getAllByText("Нет данных").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Порог успеха").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Всего").length).toBeGreaterThan(0);
+  });
+
+  it("renders real channel quality from stats-service", async () => {
+    mockStatsFetch();
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Статистика" }));
+
+    const row = await screen.findByTestId("channel-quality-email");
+    expect(row.className).not.toContain("empty");
+    expect(within(row).getByText("email")).toBeTruthy();
+    expect(row.textContent).toContain("94%");
+    expect(row.querySelector(".qualityTrack")).toBeTruthy();
+    expect((row.querySelector(".qualityFill") as HTMLElement).style.width).toBe("94%");
+    expect(screen.getAllByText("7").length).toBeGreaterThan(0);
+  });
+
+  it("updates realtime sent and failure charts from stats-service stream", async () => {
+    mockStatsFetch();
+    MockEventSource.instances = [];
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Статистика" }));
+
+    expect(await screen.findByRole("heading", { name: "Отправки / сбои real-time" })).toBeTruthy();
+    const stream = await waitFor(() => {
+      expect(MockEventSource.instances.length).toBeGreaterThan(0);
+      return MockEventSource.instances[0];
+    });
+
+    await act(async () => {
+      stream.emit("snapshot", statsPayload({
+        totals: {
+          messages: 120,
+          processed: 95,
+          success: 84,
+          failed: 8,
+          cancelled: 3,
+          pending: 25,
+          active: 1,
+          queue_depth: 11,
+          success_rate: 0.884,
+          failed_rate: 0.084,
+          p95_dispatch_ms: 51,
+        },
+        realtime: [
+          { bucket: "08:40", sent: 14, failed: 2 },
+          { bucket: "08:41", sent: 21, failed: 4 },
+        ],
+      }));
+    });
+
+    await waitFor(() => expect(screen.getByTestId("realtime-sent-last").textContent).toContain("21"));
+    expect(screen.getByTestId("realtime-failed-last").textContent).toContain("4");
+    expect(screen.getAllByText("11").length).toBeGreaterThan(0);
+  });
+
+  it("does not call stats-service unavailable when the stream is connected before the first snapshot", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/stats/overview")) {
+        return Promise.reject(new Error("stats_unavailable"));
+      }
+      return Promise.reject(new Error("backend_offline"));
+    }));
+    MockEventSource.instances = [];
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Статистика" }));
+
+    expect(await screen.findByText("Stats-service подключен")).toBeTruthy();
+    expect(screen.queryByText("Stats-service недоступен")).toBeNull();
+    expect(screen.getByText("Ждем первый snapshot статистики.")).toBeTruthy();
+  });
+
+  it("keeps a measured zero channel success rate visually empty", async () => {
+    mockStatsFetch(statsPayload({
+      channels: [
+        { code: "email", total: 8, sent: 0, failed: 8, queued: 0, cancelled: 0, success_rate: 0, failure_rate: 1, average_attempt: 3, average_latency_ms: 700 },
+      ],
+    }));
+
+    render(<App />);
+    login();
+    fireEvent.click(await screen.findByRole("button", { name: "Статистика" }));
+
+    const row = await screen.findByTestId("channel-quality-email");
+    expect(row.className).not.toContain("empty");
+    expect(row.textContent).toContain("0%");
+    expect((row.querySelector(".qualityFill") as HTMLElement).style.width).toBe("0%");
   });
 
   it("renders templates as a composer with preview and variable validation", async () => {

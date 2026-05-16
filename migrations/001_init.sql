@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   status text NOT NULL,
   filters jsonb NOT NULL DEFAULT '{}',
   selected_channels jsonb NOT NULL DEFAULT '[]',
+  specific_recipients jsonb NOT NULL DEFAULT '[]',
   total_recipients int NOT NULL DEFAULT 0,
   total_messages int NOT NULL DEFAULT 0,
   sent_count int NOT NULL DEFAULT 0,

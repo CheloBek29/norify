@@ -26,6 +26,66 @@ func TestDispatchRecipientWindowKeepsCampaignTicksSmall(t *testing.T) {
 	}
 }
 
+func TestDispatchRecipientWindowUsesSpecificRecipientCount(t *testing.T) {
+	req := contracts.CampaignDispatchRequest{
+		TotalRecipients:  100,
+		SelectedChannels: []string{"email", "sms"},
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "vip-1", Channels: []string{"email", "sms"}},
+			{UserID: "vip-2", Channels: []string{"email", "sms"}},
+			{UserID: "vip-3", Channels: []string{"email", "sms"}},
+		},
+	}
+
+	window := dispatchRecipientWindow(req, 4)
+
+	if window.Start != 1 || window.End != 2 {
+		t.Fatalf("specific recipients should window over explicit list, got %#v", window)
+	}
+	if window.NextStart != 3 {
+		t.Fatalf("expected continuation at explicit recipient 3, got %d", window.NextStart)
+	}
+}
+
+func TestBuildSendMessagesUsesSpecificRecipientIDs(t *testing.T) {
+	req := contracts.CampaignDispatchRequest{
+		CampaignID:       "cmp-1",
+		MessageBody:      "hello",
+		SelectedChannels: []string{"email", "sms"},
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "user-100", Channels: []string{"email"}},
+			{UserID: "user-250", Channels: []string{"sms"}},
+		},
+	}
+
+	messages := buildSendMessages(req, recipientWindow{Start: 1, End: 2})
+
+	if len(messages) != 2 {
+		t.Fatalf("expected exact per-recipient messages, got %d", len(messages))
+	}
+	if messages[0].UserID != "user-100" || messages[0].ChannelCode != "email" {
+		t.Fatalf("first message should use selected user/channel, got %#v", messages[0])
+	}
+	if messages[1].UserID != "user-250" || messages[1].ChannelCode != "sms" {
+		t.Fatalf("second message should use selected user/channel, got %#v", messages[1])
+	}
+}
+
+func TestDispatchTotalMessagesUsesSpecificRecipientChannels(t *testing.T) {
+	req := contracts.CampaignDispatchRequest{
+		TotalRecipients:  99,
+		SelectedChannels: []string{"email", "sms", "telegram"},
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "user-1", Channels: []string{"email"}},
+			{UserID: "user-2", Channels: []string{"sms", "telegram"}},
+		},
+	}
+
+	if got := dispatchTotalMessages(req); got != 3 {
+		t.Fatalf("dispatchTotalMessages() = %d, want 3", got)
+	}
+}
+
 func TestDispatchRecipientWindowResumesFromContinuation(t *testing.T) {
 	req := contracts.CampaignDispatchRequest{
 		TotalRecipients:  100,

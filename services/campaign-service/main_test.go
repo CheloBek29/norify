@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norify/platform/packages/contracts"
 	"github.com/norify/platform/packages/go-common/campaigns"
 )
 
@@ -80,5 +81,50 @@ func TestCanStartCampaign(t *testing.T) {
 				t.Fatalf("canStartCampaign(%q) = %v, want %v", tt.status, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPrepareSpecificRecipientsOwnsAudienceCounts(t *testing.T) {
+	recipients, totalRecipients, totalMessages := prepareSpecificRecipients(createCampaignRequest{
+		SelectedChannels: []string{"email", "sms", "telegram"},
+		TotalRecipients:  999,
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "user-2", Channels: []string{"sms"}},
+			{UserID: "user-1", Channels: []string{"email", "telegram"}},
+		},
+	})
+
+	if totalRecipients != 2 {
+		t.Fatalf("totalRecipients = %d, want 2", totalRecipients)
+	}
+	if totalMessages != 3 {
+		t.Fatalf("totalMessages = %d, want 3", totalMessages)
+	}
+	if recipients[0].UserID != "user-2" || recipients[1].UserID != "user-1" {
+		t.Fatalf("recipient order should be preserved, got %#v", recipients)
+	}
+}
+
+func TestPrepareSpecificRecipientsFallsBackToSelectedChannels(t *testing.T) {
+	recipients, _, totalMessages := prepareSpecificRecipients(createCampaignRequest{
+		SelectedChannels: []string{"email", "sms"},
+		SpecificRecipients: []contracts.CampaignRecipient{
+			{UserID: "user-1"},
+			{UserID: "user-1", Channels: []string{"telegram"}},
+			{UserID: "user-2", Channels: []string{"email", "email"}},
+		},
+	})
+
+	if len(recipients) != 2 {
+		t.Fatalf("duplicate user ids should be ignored, got %#v", recipients)
+	}
+	if strings.Join(recipients[0].Channels, ",") != "email,sms" {
+		t.Fatalf("empty per-user channels should use campaign channels, got %#v", recipients[0].Channels)
+	}
+	if strings.Join(recipients[1].Channels, ",") != "email" {
+		t.Fatalf("per-user channels should be unique, got %#v", recipients[1].Channels)
+	}
+	if totalMessages != 3 {
+		t.Fatalf("totalMessages = %d, want 3", totalMessages)
 	}
 }

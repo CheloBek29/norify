@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/norify/platform/packages/contracts"
 	"github.com/norify/platform/packages/go-common/channels"
 	"github.com/norify/platform/packages/go-common/httpapi"
 	appruntime "github.com/norify/platform/packages/go-common/runtime"
@@ -217,11 +219,50 @@ func writeChannelByCode(w http.ResponseWriter, r *http.Request, code string) {
 	}
 	for _, item := range items {
 		if item.Code == code {
+			cacheWorkerChannelConfig(r.Context(), item)
 			httpapi.WriteJSON(w, http.StatusOK, item)
 			return
 		}
 	}
 	httpapi.WriteJSON(w, http.StatusNotFound, map[string]string{"error": "channel_not_found"})
+}
+
+func cacheWorkerChannelConfig(ctx context.Context, item channelResponse) {
+	client, err := appruntime.NewRedisClientFromEnv()
+	if err != nil {
+		return
+	}
+	key := "channel-config:" + item.Code
+	if !item.Enabled {
+		_ = client.Del(ctx, key)
+		return
+	}
+	body, err := json.Marshal(workerCachePayloadFromChannel(item))
+	if err != nil {
+		return
+	}
+	_ = client.SetEX(ctx, key, channelConfigRedisTTL(), string(body))
+}
+
+func workerCachePayloadFromChannel(item channelResponse) contracts.WorkerChannelConfig {
+	return contracts.WorkerChannelConfig{
+		Code:               item.Code,
+		Enabled:            item.Enabled,
+		SuccessProbability: item.SuccessProbability,
+		MinDelaySeconds:    item.MinDelaySeconds,
+		MaxDelaySeconds:    item.MaxDelaySeconds,
+		MaxParallelism:     item.MaxParallelism,
+		RetryLimit:         item.RetryLimit,
+		Source:             "channel-service",
+	}
+}
+
+func channelConfigRedisTTL() time.Duration {
+	seconds := appruntime.EnvInt("CHANNEL_CONFIG_CACHE_TTL_SECONDS", 60)
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func responseFromConfig(config channels.Config) channelResponse {

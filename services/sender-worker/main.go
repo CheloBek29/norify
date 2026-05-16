@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -82,8 +83,8 @@ type workerPool struct {
 func newWorkerPool() *workerPool {
 	return &workerPool{
 		workers: make(map[int]context.CancelFunc),
-		min:     appruntime.EnvInt("WORKER_MIN_POOL", 2),
-		max:     appruntime.EnvInt("WORKER_MAX_POOL", 10),
+		min:     appruntime.EnvInt("WORKER_MIN_POOL", 1),
+		max:     appruntime.EnvInt("WORKER_MAX_POOL", 1),
 	}
 }
 
@@ -297,6 +298,12 @@ func processWithChannel(ctx context.Context, ch *amqp.Channel, req contracts.Sen
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = campaigns.IdempotencyKey(req.CampaignID, req.UserID, req.ChannelCode)
 	}
+	locked, release := acquireDeliveryLock(ctx, req.IdempotencyKey)
+	if !locked {
+		slog.Info("skip duplicate delivery already locked", "campaign_id", req.CampaignID, "idempotency_key", req.IdempotencyKey, "attempt", req.Attempt)
+		return nil
+	}
+	defer release()
 	active, err := campaignProcessingActive(ctx, req.CampaignID)
 	if err != nil {
 		return err
@@ -414,24 +421,207 @@ func campaignTotal(ctx context.Context, campaignID string) int {
 	return total
 }
 
+func deliveryLockKey(idempotencyKey string) string {
+	return "delivery-lock:" + idempotencyKey
+}
+
+func deliveryLockTTL() time.Duration {
+	seconds := appruntime.EnvInt("DELIVERY_LOCK_TTL_SECONDS", 30)
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func acquireDeliveryLock(ctx context.Context, idempotencyKey string) (bool, func()) {
+	if idempotencyKey == "" {
+		return true, func() {}
+	}
+	client, err := appruntime.NewRedisClientFromEnv()
+	if err != nil {
+		return true, func() {}
+	}
+	key := deliveryLockKey(idempotencyKey)
+	value := newID("worker-lock")
+	acquired, err := client.SetNXEX(ctx, key, deliveryLockTTL(), value)
+	if err != nil {
+		return true, func() {}
+	}
+	if !acquired {
+		return false, func() {}
+	}
+	return true, func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = client.DelIfValue(releaseCtx, key, value)
+	}
+}
+
+type channelConfigCacheEntry struct {
+	config    channels.Config
+	expiresAt time.Time
+}
+
+var channelConfigCache = struct {
+	sync.Mutex
+	items map[string]channelConfigCacheEntry
+}{items: map[string]channelConfigCacheEntry{}}
+
 func channelConfig(ctx context.Context, code string) channels.Config {
-	minDelay := time.Duration(appruntime.EnvInt("CHANNEL_STUB_MIN_DELAY_SECONDS", 2)) * time.Second
-	maxDelay := time.Duration(appruntime.EnvInt("CHANNEL_STUB_MAX_DELAY_SECONDS", 300)) * time.Second
-	config := channels.Config{Code: code, Enabled: true, SuccessProbability: 0.92, MinDelay: minDelay, MaxDelay: maxDelay, MaxParallelism: 100, RetryLimit: 3}
-	if db == nil {
+	if config, ok := cachedLocalChannelConfig(code); ok {
 		return config
 	}
+	fallback := defaultChannelConfig(code)
+	if config, ok := cachedRedisChannelConfig(ctx, code, fallback); ok {
+		rememberLocalChannelConfig(code, config)
+		return config
+	}
+	config, loadedFromPostgres := postgresChannelConfig(ctx, code, fallback)
+	rememberLocalChannelConfig(code, config)
+	if loadedFromPostgres {
+		cacheRedisChannelConfig(ctx, config)
+	}
+	return config
+}
+
+func defaultChannelConfig(code string) channels.Config {
+	minDelay := time.Duration(appruntime.EnvInt("CHANNEL_STUB_MIN_DELAY_SECONDS", 2)) * time.Second
+	maxDelay := time.Duration(appruntime.EnvInt("CHANNEL_STUB_MAX_DELAY_SECONDS", 300)) * time.Second
+	return channels.Config{Code: code, Enabled: true, SuccessProbability: 0.92, MinDelay: minDelay, MaxDelay: maxDelay, MaxParallelism: 100, RetryLimit: 3}
+}
+
+func postgresChannelConfig(ctx context.Context, code string, fallback channels.Config) (channels.Config, bool) {
+	if db == nil {
+		return fallback, false
+	}
+	config := fallback
 	var minSeconds, maxSeconds int
 	err := db.QueryRow(ctx, `
 		SELECT success_probability::float8, min_delay_seconds, max_delay_seconds, max_parallelism, retry_limit
 		FROM channels
 		WHERE code = $1 AND enabled = true`, code).Scan(&config.SuccessProbability, &minSeconds, &maxSeconds, &config.MaxParallelism, &config.RetryLimit)
 	if err != nil {
-		return config
+		return fallback, false
 	}
 	config.MinDelay = time.Duration(appruntime.EnvInt("CHANNEL_STUB_MIN_DELAY_SECONDS", minSeconds)) * time.Second
 	config.MaxDelay = time.Duration(appruntime.EnvInt("CHANNEL_STUB_MAX_DELAY_SECONDS", maxSeconds)) * time.Second
-	return config
+	return config, true
+}
+
+func channelConfigCacheKey(code string) string {
+	return "channel-config:" + code
+}
+
+func channelConfigLocalTTL() time.Duration {
+	seconds := appruntime.EnvInt("CHANNEL_CONFIG_LOCAL_TTL_SECONDS", 5)
+	if seconds <= 0 {
+		seconds = 5
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func channelConfigRedisTTL() time.Duration {
+	seconds := appruntime.EnvInt("CHANNEL_CONFIG_CACHE_TTL_SECONDS", 60)
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func cachedLocalChannelConfig(code string) (channels.Config, bool) {
+	channelConfigCache.Lock()
+	defer channelConfigCache.Unlock()
+	entry, ok := channelConfigCache.items[code]
+	if !ok {
+		return channels.Config{}, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(channelConfigCache.items, code)
+		return channels.Config{}, false
+	}
+	return entry.config, true
+}
+
+func rememberLocalChannelConfig(code string, config channels.Config) {
+	channelConfigCache.Lock()
+	defer channelConfigCache.Unlock()
+	channelConfigCache.items[code] = channelConfigCacheEntry{config: config, expiresAt: time.Now().Add(channelConfigLocalTTL())}
+}
+
+func resetLocalChannelConfigCache() {
+	channelConfigCache.Lock()
+	defer channelConfigCache.Unlock()
+	channelConfigCache.items = map[string]channelConfigCacheEntry{}
+}
+
+func cachedRedisChannelConfig(ctx context.Context, code string, fallback channels.Config) (channels.Config, bool) {
+	client, err := appruntime.NewRedisClientFromEnv()
+	if err != nil {
+		return channels.Config{}, false
+	}
+	raw, ok, err := client.Get(ctx, channelConfigCacheKey(code))
+	if err != nil || !ok {
+		return channels.Config{}, false
+	}
+	var cached contracts.WorkerChannelConfig
+	if err := json.Unmarshal([]byte(raw), &cached); err != nil {
+		return channels.Config{}, false
+	}
+	return configFromWorkerCache(cached, fallback), true
+}
+
+func cacheRedisChannelConfig(ctx context.Context, config channels.Config) {
+	client, err := appruntime.NewRedisClientFromEnv()
+	if err != nil {
+		return
+	}
+	payload := contracts.WorkerChannelConfig{
+		Code:               config.Code,
+		Enabled:            config.Enabled,
+		SuccessProbability: config.SuccessProbability,
+		MinDelaySeconds:    int(config.MinDelay / time.Second),
+		MaxDelaySeconds:    int(config.MaxDelay / time.Second),
+		MaxParallelism:     config.MaxParallelism,
+		RetryLimit:         config.RetryLimit,
+		Source:             "postgres",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = client.SetEX(ctx, channelConfigCacheKey(config.Code), channelConfigRedisTTL(), string(body))
+}
+
+func configFromWorkerCache(cached contracts.WorkerChannelConfig, fallback channels.Config) channels.Config {
+	if cached.Code == "" {
+		cached.Code = fallback.Code
+	}
+	if cached.SuccessProbability <= 0 {
+		cached.SuccessProbability = fallback.SuccessProbability
+	}
+	if cached.MinDelaySeconds <= 0 {
+		cached.MinDelaySeconds = int(fallback.MinDelay / time.Second)
+	}
+	if cached.MaxDelaySeconds <= 0 {
+		cached.MaxDelaySeconds = int(fallback.MaxDelay / time.Second)
+	}
+	if cached.MaxParallelism <= 0 {
+		cached.MaxParallelism = fallback.MaxParallelism
+	}
+	if cached.RetryLimit <= 0 {
+		cached.RetryLimit = fallback.RetryLimit
+	}
+	minSeconds := appruntime.EnvInt("CHANNEL_STUB_MIN_DELAY_SECONDS", cached.MinDelaySeconds)
+	maxSeconds := appruntime.EnvInt("CHANNEL_STUB_MAX_DELAY_SECONDS", cached.MaxDelaySeconds)
+	return channels.Config{
+		Code:               cached.Code,
+		Enabled:            cached.Enabled,
+		SuccessProbability: cached.SuccessProbability,
+		MinDelay:           time.Duration(minSeconds) * time.Second,
+		MaxDelay:           time.Duration(maxSeconds) * time.Second,
+		MaxParallelism:     cached.MaxParallelism,
+		RetryLimit:         cached.RetryLimit,
+	}
 }
 
 type deliveryWriteResult struct {

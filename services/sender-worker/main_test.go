@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/norify/platform/packages/contracts"
+)
 
 func TestCanProcessCampaignStatus(t *testing.T) {
 	if !canProcessCampaignStatus("running") {
@@ -17,6 +22,23 @@ func TestCanProcessCampaignStatus(t *testing.T) {
 	}
 	if canProcessCampaignStatus("finished") {
 		t.Fatalf("finished campaign must not process queued sends")
+	}
+}
+
+func TestWorkerPoolDefaultsToOneWorkerPerContainer(t *testing.T) {
+	t.Setenv("WORKER_MIN_POOL", "")
+	t.Setenv("WORKER_MAX_POOL", "")
+
+	pool := newWorkerPool()
+
+	if pool.min != 1 {
+		t.Fatalf("default min pool should keep one worker per container, got %d", pool.min)
+	}
+	if pool.max != 1 {
+		t.Fatalf("default max pool should keep one worker per container, got %d", pool.max)
+	}
+	if target := pool.targetSize(1000); target != 1 {
+		t.Fatalf("queue depth must scale containers, not in-process workers; got target %d", target)
 	}
 }
 
@@ -69,5 +91,57 @@ func TestCanSendDelivery(t *testing.T) {
 				t.Fatalf("canSendDelivery(%q, %d, %d) = %v, want %v", tt.previousStatus, tt.previousAttempt, tt.nextAttempt, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChannelConfigCacheKey(t *testing.T) {
+	if got := channelConfigCacheKey("telegram"); got != "channel-config:telegram" {
+		t.Fatalf("channelConfigCacheKey = %q", got)
+	}
+}
+
+func TestDeliveryLockKey(t *testing.T) {
+	if got := deliveryLockKey("cmp:user:email"); got != "delivery-lock:cmp:user:email" {
+		t.Fatalf("deliveryLockKey = %q", got)
+	}
+}
+
+func TestConfigFromWorkerCacheUsesRedisPayload(t *testing.T) {
+	fallback := defaultChannelConfig("telegram")
+	got := configFromWorkerCache(contracts.WorkerChannelConfig{
+		Code:               "telegram",
+		Enabled:            true,
+		SuccessProbability: 0.77,
+		MinDelaySeconds:    4,
+		MaxDelaySeconds:    9,
+		MaxParallelism:     42,
+		RetryLimit:         5,
+		Source:             "redis",
+	}, fallback)
+
+	if got.Code != "telegram" || !got.Enabled {
+		t.Fatalf("unexpected code/enabled: %#v", got)
+	}
+	if got.SuccessProbability != 0.77 {
+		t.Fatalf("success probability = %v", got.SuccessProbability)
+	}
+	if got.MinDelay != 4*time.Second || got.MaxDelay != 9*time.Second {
+		t.Fatalf("delay = %s..%s", got.MinDelay, got.MaxDelay)
+	}
+	if got.MaxParallelism != 42 || got.RetryLimit != 5 {
+		t.Fatalf("parallelism/retry = %d/%d", got.MaxParallelism, got.RetryLimit)
+	}
+}
+
+func TestLocalChannelConfigCacheExpires(t *testing.T) {
+	resetLocalChannelConfigCache()
+	t.Setenv("CHANNEL_CONFIG_LOCAL_TTL_SECONDS", "1")
+	rememberLocalChannelConfig("email", defaultChannelConfig("email"))
+	if _, ok := cachedLocalChannelConfig("email"); !ok {
+		t.Fatalf("expected cached config")
+	}
+	channelConfigCache.items["email"] = channelConfigCacheEntry{expiresAt: time.Now().Add(-time.Second)}
+	if _, ok := cachedLocalChannelConfig("email"); ok {
+		t.Fatalf("expired config must miss")
 	}
 }

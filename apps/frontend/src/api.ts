@@ -129,6 +129,47 @@ export type ServiceHealth = {
   detail: string;
 };
 
+export type StatsTotals = {
+  messages: number;
+  processed: number;
+  success: number;
+  failed: number;
+  cancelled: number;
+  pending: number;
+  active: number;
+  queueDepth: number;
+  successRate: number | null;
+  failedRate: number | null;
+  p95DispatchMs: number;
+};
+
+export type StatsChannel = {
+  code: string;
+  total: number;
+  sent: number;
+  failed: number;
+  queued: number;
+  cancelled: number;
+  successRate: number | null;
+  failureRate: number | null;
+  averageAttempt: number | null;
+  averageLatencyMs: number | null;
+};
+
+export type StatsRealtimePoint = {
+  bucket: string;
+  sent: number;
+  failed: number;
+};
+
+export type StatsSnapshot = {
+  generatedAt: string;
+  source: string;
+  totals: StatsTotals;
+  channels: StatsChannel[];
+  realtime: StatsRealtimePoint[];
+};
+
 export const credentials: Record<Role, { email: string; password: string }> = {
   admin: { email: "admin@example.com", password: "admin123" },
   manager: { email: "manager@example.com", password: "manager123" },
@@ -181,7 +222,7 @@ export const channelsSeed: Channel[] = [
   { code: "telegram", name: "Telegram", enabled: true, successProbability: 0.82, minDelaySeconds: 2, maxDelaySeconds: 120, maxParallelism: 120, retryLimit: 3, degraded: true },
   { code: "whatsapp", name: "WhatsApp", enabled: true, successProbability: 0.9, minDelaySeconds: 2, maxDelaySeconds: 120, maxParallelism: 100, retryLimit: 3 },
   { code: "vk", name: "VK", enabled: true, successProbability: 0.89, minDelaySeconds: 2, maxDelaySeconds: 120, maxParallelism: 100, retryLimit: 3 },
-  { code: "max", name: "MAX", enabled: false, successProbability: 0.93, minDelaySeconds: 2, maxDelaySeconds: 140, maxParallelism: 70, retryLimit: 2 },
+  { code: "max", name: "Max", enabled: true, successProbability: 0.93, minDelaySeconds: 2, maxDelaySeconds: 140, maxParallelism: 70, retryLimit: 2 },
   { code: "custom_app", name: "Custom App", enabled: true, successProbability: 0.98, minDelaySeconds: 2, maxDelaySeconds: 45, maxParallelism: 220, retryLimit: 3 },
 ];
 
@@ -210,12 +251,12 @@ export const campaignsSeed: Campaign[] = [
     templateName: "Реактивация клиента",
     status: "running",
     filters: defaultFilter,
-    selectedChannels: ["email", "telegram", "custom_app"],
+    selectedChannels: ["email", "max", "custom_app"],
     totalRecipients: 50000,
     totalMessages: 150000,
     processed: 5120,
     success: 4781,
-    failed: 339,
+    failed: 173,
     cancelled: 0,
     p95DispatchMs: 942,
     createdAt: "2026-05-13T08:55:00Z",
@@ -242,7 +283,7 @@ export const campaignsSeed: Campaign[] = [
 
 export const deliveriesSeed: Delivery[] = [
   { id: "d1", campaignId: "cmp-spring", userId: "user-00001", channelCode: "email", status: "sent", attempt: 1, finishedAt: "2026-05-13T09:01:10Z" },
-  { id: "d2", campaignId: "cmp-spring", userId: "user-00001", channelCode: "telegram", status: "failed", attempt: 3, errorCode: "channel_timeout", errorMessage: "Telegram adapter timeout", finishedAt: "2026-05-13T09:03:44Z" },
+  { id: "d2", campaignId: "cmp-spring", userId: "user-00001", channelCode: "max", status: "sent", attempt: 1, finishedAt: "2026-05-13T09:03:44Z" },
   { id: "d3", campaignId: "cmp-spring", userId: "user-00002", channelCode: "custom_app", status: "sent", attempt: 1, finishedAt: "2026-05-13T09:02:02Z" },
   { id: "d4", campaignId: "cmp-spring", userId: "user-00003", channelCode: "email", status: "queued", attempt: 1 },
 ];
@@ -251,37 +292,6 @@ export const eventsSeed: SystemEvent[] = [
   { id: "e1", service: "campaign-service", level: "info", type: "campaign.started", message: "Campaign cmp-spring started", createdAt: "2026-05-13T09:00:00Z" },
   { id: "e2", service: "dispatcher-service", level: "info", type: "batch.dispatched", message: "150 batches queued in 942 ms p95", createdAt: "2026-05-13T09:00:01Z" },
   { id: "e3", service: "sender-worker", level: "warn", type: "channel.degraded", message: "Telegram timeout rate above threshold", createdAt: "2026-05-13T09:03:44Z" },
-];
-
-export const currentError: ActionableError = {
-  title: "Telegram временно недоступен",
-  description: "Часть сообщений не была отправлена через Telegram из-за превышения таймаута канала.",
-  impact: "Остальные каналы продолжают отправку. Ошибка затронула 842 сообщения.",
-  actions: [
-    { code: "retry", label: "Повторить" },
-    { code: "switch_channel", label: "Сменить канал" },
-    { code: "cancel_campaign", label: "Отменить" },
-  ],
-};
-
-export const errorGroupsSeed: ErrorGroup[] = [
-  {
-    id: "telegram-timeout",
-    campaignId: "cmp-spring",
-    channelCode: "telegram",
-    errorCode: "channel_timeout",
-    errorMessage: "Telegram adapter timeout",
-    failedCount: 339,
-    maxAttempt: 3,
-    firstSeenAt: "2026-05-13T09:03:44Z",
-    lastSeenAt: "2026-05-13T09:07:12Z",
-    impact: "Затронуто 339 сообщений. Основная очередь продолжает обработку.",
-    recommendedActions: [
-      { code: "retry", label: "Повторить группу" },
-      { code: "switch_channel", label: "Вставить через другой канал" },
-      { code: "cancel_group", label: "Закрыть группу" },
-    ],
-  },
 ];
 
 export function audiencePreview(filter: AudienceFilter): number {
@@ -308,16 +318,22 @@ export function effectiveTotalMessages(campaign: Campaign): number {
   return campaign.totalRecipients * campaign.selectedChannels.length;
 }
 
+const useFrontendProxy = import.meta.env.PROD;
+
+const serviceBase = (service: string, localPort: number) =>
+  useFrontendProxy ? `/api/${service}` : `http://localhost:${localPort}`;
+
 const api = {
-  auth: "http://localhost:8081",
-  users: "http://localhost:8082",
-  templates: "http://localhost:8083",
-  channels: "http://localhost:8084",
-  campaigns: "http://localhost:8085",
-  dispatcher: "http://localhost:8086",
-  sender: "http://localhost:8087",
-  errors: "http://localhost:8088",
-  status: "http://localhost:8090",
+  auth: serviceBase("auth-service", 8081),
+  users: serviceBase("user-service", 8082),
+  templates: serviceBase("template-service", 8083),
+  channels: serviceBase("channel-service", 8084),
+  campaigns: serviceBase("campaign-service", 8085),
+  dispatcher: serviceBase("dispatcher-service", 8086),
+  sender: serviceBase("sender-worker", 8087),
+  errors: serviceBase("notification-error-service", 8088),
+  ops: serviceBase("ops-gateway", 8090),
+  stats: serviceBase("stats-service", 8092),
 };
 
 export const serviceHealthTargets = [
@@ -329,34 +345,133 @@ export const serviceHealthTargets = [
   { id: "dispatcher-service", name: "dispatcher-service", url: `${api.dispatcher}/health/ready` },
   { id: "sender-worker", name: "sender-worker", url: `${api.sender}/health/ready` },
   { id: "notification-error-service", name: "notification-error-service", url: `${api.errors}/health/ready` },
-  { id: "status-service", name: "status-service", url: `${api.status}/health/ready` },
+  { id: "ops-gateway", name: "ops-gateway", url: `${api.ops}/health/ready` },
+  { id: "stats-service", name: "stats-service", url: `${api.stats}/health/ready` },
 ];
 
 export async function fetchServiceHealth(): Promise<ServiceHealth[]> {
+  try {
+    const response = await fetch(`${api.ops}/ops/overview`, { signal: AbortSignal.timeout(2500) });
+    if (response.ok) {
+      const data = await response.json();
+      if (Array.isArray(data.services)) {
+        return data.services.map((item: Record<string, unknown>) => normalizeServiceHealth(item));
+      }
+    }
+  } catch {
+    // Fall back to browser-side checks when ops-gateway is unavailable.
+  }
   return Promise.all(serviceHealthTargets.map(checkServiceHealth));
 }
 
 export type WorkerStats = {
   activeWorkers: number;
+  containerWorkers: number;
   minWorkers: number;
   maxWorkers: number;
   queueDepth: number;
+  replicas: number;
+  desiredReplicas: number;
+  minReplicas: number;
+  maxReplicas: number;
+  controlMode: string;
+  controlEnabled: boolean;
+  autoscaler: string;
 };
 
 export async function fetchWorkerStats(): Promise<WorkerStats | null> {
   try {
-    const response = await fetch(`${api.sender}/worker/stats`, { signal: AbortSignal.timeout(2000) });
+    const response = await fetch(`${api.ops}/workers/status`, { signal: AbortSignal.timeout(2000) });
     if (!response.ok) return null;
     const data = await response.json();
-    return {
-      activeWorkers: data.active_workers ?? 0,
-      minWorkers: data.min_workers ?? 0,
-      maxWorkers: data.max_workers ?? 0,
-      queueDepth: data.queue_depth ?? 0,
-    };
+    return normalizeWorkerStats(data);
   } catch {
-    return null;
+    try {
+      const response = await fetch(`${api.sender}/worker/stats`, { signal: AbortSignal.timeout(2000) });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return normalizeWorkerStats(data);
+    } catch {
+      return null;
+    }
   }
+}
+
+export async function updateWorkerBounds(minReplicas: number, maxReplicas: number): Promise<WorkerStats | null> {
+  const response = await fetch(`${api.ops}/workers/bounds`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ min_replicas: minReplicas, max_replicas: maxReplicas }),
+  });
+  if (!response.ok) return null;
+  return normalizeWorkerStats(await response.json());
+}
+
+export async function fetchStatsSnapshot(): Promise<StatsSnapshot> {
+  const response = await fetch(`${api.stats}/stats/overview`, { signal: AbortSignal.timeout(2500) });
+  if (!response.ok) throw new Error("stats_unavailable");
+  return normalizeStatsSnapshot(await response.json());
+}
+
+export function statsStreamURL(): string {
+  return `${api.stats}/stats/stream`;
+}
+
+export function normalizeStatsSnapshot(data: Record<string, unknown>): StatsSnapshot {
+  const totals = (data.totals ?? data.Totals ?? {}) as Record<string, unknown>;
+  return {
+    generatedAt: String(data.generated_at ?? data.generatedAt ?? data.GeneratedAt ?? new Date().toISOString()),
+    source: String(data.source ?? data.Source ?? "stats-service"),
+    totals: {
+      messages: Number(totals.messages ?? totals.Messages ?? 0),
+      processed: Number(totals.processed ?? totals.Processed ?? 0),
+      success: Number(totals.success ?? totals.Success ?? 0),
+      failed: Number(totals.failed ?? totals.Failed ?? 0),
+      cancelled: Number(totals.cancelled ?? totals.Cancelled ?? 0),
+      pending: Number(totals.pending ?? totals.Pending ?? 0),
+      active: Number(totals.active ?? totals.Active ?? 0),
+      queueDepth: Number(totals.queue_depth ?? totals.queueDepth ?? totals.QueueDepth ?? 0),
+      successRate: optionalNumber(totals.success_rate ?? totals.successRate ?? totals.SuccessRate),
+      failedRate: optionalNumber(totals.failed_rate ?? totals.failedRate ?? totals.FailedRate),
+      p95DispatchMs: Number(totals.p95_dispatch_ms ?? totals.p95DispatchMs ?? totals.P95DispatchMs ?? 0),
+    },
+    channels: ((data.channels ?? data.Channels ?? []) as Record<string, unknown>[]).map((item) => ({
+      code: String(item.code ?? item.Code ?? ""),
+      total: Number(item.total ?? item.Total ?? 0),
+      sent: Number(item.sent ?? item.Sent ?? 0),
+      failed: Number(item.failed ?? item.Failed ?? 0),
+      queued: Number(item.queued ?? item.Queued ?? 0),
+      cancelled: Number(item.cancelled ?? item.Cancelled ?? 0),
+      successRate: optionalNumber(item.success_rate ?? item.successRate ?? item.SuccessRate),
+      failureRate: optionalNumber(item.failure_rate ?? item.failureRate ?? item.FailureRate),
+      averageAttempt: optionalNumber(item.average_attempt ?? item.averageAttempt ?? item.AverageAttempt),
+      averageLatencyMs: optionalNumber(item.average_latency_ms ?? item.averageLatencyMs ?? item.AverageLatencyMs),
+    })),
+    realtime: ((data.realtime ?? data.Realtime ?? []) as Record<string, unknown>[]).map((item) => ({
+      bucket: String(item.bucket ?? item.Bucket ?? ""),
+      sent: Number(item.sent ?? item.Sent ?? 0),
+      failed: Number(item.failed ?? item.Failed ?? 0),
+    })),
+  };
+}
+
+function normalizeWorkerStats(data: Record<string, unknown>): WorkerStats {
+  const containerWorkers = Number(data.container_workers ?? data.active_workers ?? 0);
+  const replicas = Number(data.replicas ?? 1);
+  return {
+    activeWorkers: Number(data.active_workers ?? containerWorkers * replicas),
+    containerWorkers,
+    minWorkers: Number(data.min_workers ?? 0),
+    maxWorkers: Number(data.max_workers ?? 0),
+    queueDepth: Number(data.queue_depth ?? 0),
+    replicas,
+    desiredReplicas: Number(data.desired_replicas ?? replicas),
+    minReplicas: Number(data.min_replicas ?? replicas),
+    maxReplicas: Number(data.max_replicas ?? data.max_workers ?? 1),
+    controlMode: String(data.control_mode ?? "direct"),
+    controlEnabled: Boolean(data.control_enabled ?? false),
+    autoscaler: String(data.autoscaler ?? "read-only"),
+  };
 }
 
 async function checkServiceHealth(target: (typeof serviceHealthTargets)[number]): Promise<ServiceHealth> {
@@ -381,6 +496,18 @@ async function checkServiceHealth(target: (typeof serviceHealthTargets)[number])
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+function normalizeServiceHealth(item: Record<string, unknown>): ServiceHealth {
+  return {
+    id: String(item.id ?? item.name ?? "service"),
+    name: String(item.name ?? item.id ?? "service"),
+    url: String(item.url ?? ""),
+    status: item.status === "ready" ? "ready" : item.status === "checking" ? "checking" : "down",
+    latencyMs: Number(item.latency_ms ?? item.latencyMs ?? 0),
+    checkedAt: String(item.checked_at ?? item.checkedAt ?? new Date().toISOString()),
+    detail: String(item.detail ?? item.status ?? ""),
+  };
 }
 
 export async function backendLogin(email: string, password: string): Promise<{ email: string; role: Role }> {
@@ -465,11 +592,17 @@ export async function fetchChannels(): Promise<Channel[]> {
 }
 
 export function campaignWebSocketURL(campaignId: string): string {
-  return `${api.status.replace(/^http/, "ws")}/ws/campaigns/${campaignId}`;
+  return webSocketURL(api.ops, `/ws/campaigns/${campaignId}`);
 }
 
 export function operationsWebSocketURL(): string {
-  return `${api.status.replace(/^http/, "ws")}/ws/ops`;
+  return webSocketURL(api.ops, "/ws/ops");
+}
+
+function webSocketURL(base: string, path: string): string {
+  if (base.startsWith("http")) return `${base.replace(/^http/, "ws")}${path}`;
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${base}${path}`;
 }
 
 export function normalizeCampaign(item: Record<string, unknown>): Campaign {

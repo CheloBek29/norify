@@ -4,15 +4,19 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import uuid
 import time
+import ssl
+import inspect
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -79,6 +83,11 @@ class WorkerChannelConfig(BaseModel):
     source: str = "default"
 
 
+class WorkerBoundsRequest(BaseModel):
+    min_replicas: int = Field(ge=1)
+    max_replicas: int = Field(ge=1)
+
+
 snapshots: dict[str, ProgressSnapshot] = {}
 connections: dict[str, set[WebSocket]] = {}
 ops_connections: set[WebSocket] = set()
@@ -86,12 +95,22 @@ campaign_totals: dict[str, int] = {}
 message_states: dict[str, dict[str, str]] = {}
 processed_result_keys: set[str] = set()
 queued_jobs: dict[str, SendMessageJob] = {}
-logger = logging.getLogger("status-service")
+SERVICE_NAME = "ops-gateway"
+logger = logging.getLogger(SERVICE_NAME)
 CAMPAIGN_SERVICE_URL = os.getenv("CAMPAIGN_SERVICE_URL", "http://campaign-service:8080")
 CHANNEL_SERVICE_URL = os.getenv("CHANNEL_SERVICE_URL", "http://channel-service:8080")
 TEMPLATE_SERVICE_URL = os.getenv("TEMPLATE_SERVICE_URL", "http://template-service:8080")
+SENDER_SERVICE_URL = os.getenv("SENDER_SERVICE_URL", "http://sender-worker:8080")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
+worker_replica_state = {"desired_replicas": int(os.getenv("SENDER_WORKER_REPLICAS", "1"))}
+worker_bounds_state = {
+    "min_replicas": int(os.getenv("WORKER_CONTROL_MIN_REPLICAS", os.getenv("SENDER_WORKER_REPLICAS", "1"))),
+    "max_replicas": int(os.getenv("WORKER_CONTROL_MAX_REPLICAS", "20")),
+}
+CAMPAIGN_SNAPSHOT_TTL_SECONDS = int(os.getenv("CAMPAIGN_SNAPSHOT_TTL_SECONDS", "3600"))
+WORKER_POLICY_TTL_SECONDS = int(os.getenv("WORKER_POLICY_TTL_SECONDS", "86400"))
+WORKER_POLICY_KEY = "worker-scaling-policy:sender-worker"
 HEALTH_TARGETS = [
     ("auth-service", os.getenv("AUTH_SERVICE_URL", "http://auth-service:8080")),
     ("user-service", os.getenv("USER_SERVICE_URL", "http://user-service:8080")),
@@ -99,9 +118,9 @@ HEALTH_TARGETS = [
     ("channel-service", CHANNEL_SERVICE_URL),
     ("campaign-service", CAMPAIGN_SERVICE_URL),
     ("dispatcher-service", os.getenv("DISPATCHER_SERVICE_URL", "http://dispatcher-service:8080")),
-    ("sender-worker", os.getenv("SENDER_SERVICE_URL", "http://sender-worker:8080")),
+    ("sender-worker", SENDER_SERVICE_URL),
     ("notification-error-service", os.getenv("NOTIFICATION_ERROR_SERVICE_URL", "http://notification-error-service:8080")),
-    ("status-service", os.getenv("STATUS_SERVICE_URL", "http://status-service:8080")),
+    (SERVICE_NAME, os.getenv("OPS_GATEWAY_URL", os.getenv("STATUS_SERVICE_URL", "http://ops-gateway:8080"))),
 ]
 
 
@@ -113,7 +132,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Norify Status Service", lifespan=lifespan)
+app = FastAPI(title="Norify Ops Gateway", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -124,12 +143,52 @@ app.add_middleware(
 
 @app.get("/health/live")
 async def live() -> dict[str, str]:
-    return {"status": "live", "service": "status-service"}
+    return {"status": "live", "service": SERVICE_NAME}
 
 
 @app.get("/health/ready")
 async def ready() -> dict[str, str]:
-    return {"status": "ready", "service": "status-service"}
+    return {"status": "ready", "service": SERVICE_NAME}
+
+
+@app.get("/ops/overview")
+async def ops_overview() -> dict[str, Any]:
+    services = await asyncio.gather(*(check_service_health(name, url) for name, url in HEALTH_TARGETS))
+    worker = await build_worker_status()
+    campaign_snapshots = await list_campaign_snapshots()
+    ready_count = sum(1 for service in services if service["status"] == "ready")
+    active_campaigns = sum(1 for snapshot in campaign_snapshots if snapshot.status in {"running", "retrying"})
+    return {
+        "service": SERVICE_NAME,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "services_ready": ready_count,
+            "services_total": len(services),
+            "active_campaigns": active_campaigns,
+            "tracked_campaigns": len(campaign_snapshots),
+            "processed_messages": sum(snapshot.processed for snapshot in campaign_snapshots),
+            "failed_messages": sum(snapshot.failed for snapshot in campaign_snapshots),
+            "websocket_clients": sum(len(items) for items in connections.values()) + len(ops_connections),
+        },
+        "services": services,
+        "worker": worker,
+        "campaigns": [snapshot.model_dump(mode="json") for snapshot in campaign_snapshots],
+    }
+
+
+@app.get("/workers/status")
+async def workers_status() -> dict[str, Any]:
+    return await build_worker_status()
+
+
+@app.post("/workers/bounds")
+async def update_worker_bounds(request: WorkerBoundsRequest) -> dict[str, Any]:
+    if request.min_replicas > request.max_replicas:
+        raise HTTPException(status_code=400, detail="min_replicas_must_not_exceed_max_replicas")
+    if not worker_control_enabled():
+        raise HTTPException(status_code=503, detail="worker_control_disabled")
+    policy = await maybe_await(apply_worker_bounds(request.min_replicas, request.max_replicas))
+    return await build_worker_status(policy)
 
 
 @app.get("/metrics")
@@ -140,12 +199,12 @@ async def metrics() -> str:
 
 @app.get("/campaigns/{campaign_id}/snapshot", response_model=ProgressSnapshot)
 async def snapshot(campaign_id: str) -> ProgressSnapshot:
-    return snapshots.get(campaign_id, ProgressSnapshot(campaign_id=campaign_id))
+    return await read_campaign_snapshot(campaign_id)
 
 
 @app.post("/events/status", response_model=ProgressSnapshot)
 async def ingest_status(event: ProgressSnapshot) -> ProgressSnapshot:
-    snapshots[event.campaign_id] = event
+    await remember_campaign_snapshot(event)
     await broadcast(event.campaign_id, event.model_dump(mode="json"))
     return event
 
@@ -155,7 +214,7 @@ async def campaign_ws(websocket: WebSocket, campaign_id: str) -> None:
     await websocket.accept()
     connections.setdefault(campaign_id, set()).add(websocket)
     try:
-        await websocket.send_json(snapshots.get(campaign_id, ProgressSnapshot(campaign_id=campaign_id)).model_dump(mode="json"))
+        await websocket.send_json((await read_campaign_snapshot(campaign_id)).model_dump(mode="json"))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -219,6 +278,7 @@ async def handle_ops_command(command: dict[str, Any]) -> dict[str, Any]:
                 "filters": payload.get("filters", {}),
                 "selected_channels": payload.get("selected_channels", []),
                 "total_recipients": payload.get("total_recipients", 0),
+                "specific_recipients": payload.get("specific_recipients", []),
             })
             campaign_id = str(campaign["id"])
             started = await proxy_json("POST", f"{CAMPAIGN_SERVICE_URL}/campaigns/{campaign_id}/start")
@@ -281,6 +341,17 @@ async def handle_ops_command(command: dict[str, Any]) -> dict[str, Any]:
             services = await asyncio.gather(*(check_service_health(name, url) for name, url in HEALTH_TARGETS))
             return {"type": "health.snapshot", "request_id": request_id, "services": services}
 
+        if command_type == "worker.bounds":
+            min_replicas = int(payload.get("min_replicas") or payload.get("minReplicas") or 0)
+            max_replicas = int(payload.get("max_replicas") or payload.get("maxReplicas") or 0)
+            if min_replicas < 1 or max_replicas < 1 or min_replicas > max_replicas:
+                raise RuntimeError("invalid_worker_bounds")
+            if not worker_control_enabled():
+                raise RuntimeError("worker_control_disabled")
+            policy = await maybe_await(apply_worker_bounds(min_replicas, max_replicas))
+            status = await build_worker_status(policy)
+            return {"type": "worker.status", "request_id": request_id, **status}
+
         raise RuntimeError(f"unknown_command:{command_type}")
     except Exception as exc:
         logger.warning("websocket operation failed: %s", exc)
@@ -329,6 +400,154 @@ async def check_service_health(name: str, base_url: str) -> dict[str, Any]:
     except Exception as exc:
         latency_ms = round((time.perf_counter() - started_at) * 1000)
         return {"id": name, "name": name, "url": url, "status": "down", "latency_ms": latency_ms, "checked_at": checked_at, "detail": str(exc)}
+
+
+async def build_worker_status(scaling_policy: dict[str, int] | None = None) -> dict[str, Any]:
+    stats = await read_sender_worker_stats()
+    replicas = scaling_policy or await maybe_await(read_worker_scaling_policy())
+    container_workers = int(stats.get("active_workers", 0))
+    active_replicas = int(replicas.get("replicas", replicas.get("desired_replicas", 1)))
+    return {
+        "active_workers": container_workers * active_replicas,
+        "container_workers": container_workers,
+        "min_workers": int(stats.get("min_workers", 0)),
+        "max_workers": int(stats.get("max_workers", 0)),
+        "queue_depth": int(stats.get("queue_depth", -1)),
+        "replicas": active_replicas,
+        "desired_replicas": int(replicas.get("desired_replicas", active_replicas)),
+        "min_replicas": int(replicas.get("min_replicas", 1)),
+        "max_replicas": int(replicas.get("max_replicas", worker_max_replicas())),
+        "control_mode": worker_control_mode(),
+        "control_enabled": worker_control_enabled(),
+        "autoscaler": worker_autoscaler_name(),
+    }
+
+
+async def read_sender_worker_stats() -> dict[str, Any]:
+    try:
+        return await proxy_json("GET", f"{SENDER_SERVICE_URL}/worker/stats")
+    except Exception as exc:
+        logger.warning("sender worker stats unavailable: %s", exc)
+        return {"active_workers": 0, "min_workers": 0, "max_workers": 0, "queue_depth": -1}
+
+
+def worker_control_mode() -> str:
+    return os.getenv("WORKER_CONTROL_MODE", "disabled").lower()
+
+
+def worker_control_enabled() -> bool:
+    return worker_control_mode() in {"kubernetes", "memory"}
+
+
+def worker_autoscaler_name() -> str:
+    if worker_control_mode() == "kubernetes":
+        return "kubernetes-hpa"
+    if worker_control_mode() == "memory":
+        return "ops-gateway-memory"
+    return "read-only"
+
+
+def worker_max_replicas() -> int:
+    try:
+        value = int(os.getenv("WORKER_CONTROL_MAX_REPLICAS", "20"))
+    except ValueError:
+        return 20
+    return max(1, value)
+
+
+async def read_worker_scaling_policy() -> dict[str, int]:
+    if worker_control_mode() == "kubernetes":
+        return read_kubernetes_worker_scaling_policy()
+    if worker_control_mode() == "disabled":
+        return read_dns_worker_replicas()
+    cached = await read_worker_scaling_policy_from_redis()
+    if cached:
+        worker_replica_state["desired_replicas"] = cached["desired_replicas"]
+        worker_bounds_state["min_replicas"] = cached["min_replicas"]
+        worker_bounds_state["max_replicas"] = cached["max_replicas"]
+        return cached
+    desired = max(1, int(worker_replica_state.get("desired_replicas", 1)))
+    return {
+        "replicas": desired,
+        "desired_replicas": desired,
+        "min_replicas": int(worker_bounds_state["min_replicas"]),
+        "max_replicas": int(worker_bounds_state["max_replicas"]),
+    }
+
+
+def read_dns_worker_replicas() -> dict[str, int]:
+    try:
+        host = urllib.parse.urlparse(SENDER_SERVICE_URL).hostname or "sender-worker"
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, None, family=socket.AF_INET)}
+        replicas = max(1, len(addresses))
+    except Exception:
+        replicas = max(1, int(os.getenv("SENDER_WORKER_REPLICAS", "1")))
+    return {
+        "replicas": replicas,
+        "desired_replicas": replicas,
+        "min_replicas": replicas,
+        "max_replicas": replicas,
+    }
+
+
+async def apply_worker_bounds(min_replicas: int, max_replicas: int) -> dict[str, int]:
+    if worker_control_mode() == "kubernetes":
+        return apply_kubernetes_worker_bounds(min_replicas, max_replicas)
+    if worker_control_mode() != "memory":
+        raise RuntimeError("worker_control_disabled")
+    worker_bounds_state["min_replicas"] = min_replicas
+    worker_bounds_state["max_replicas"] = max_replicas
+    desired = max(min_replicas, min(int(worker_replica_state.get("desired_replicas", min_replicas)), max_replicas))
+    worker_replica_state["desired_replicas"] = desired
+    policy = {
+        "replicas": desired,
+        "desired_replicas": desired,
+        "min_replicas": min_replicas,
+        "max_replicas": max_replicas,
+    }
+    await write_worker_scaling_policy_to_redis(policy)
+    return policy
+
+
+def read_kubernetes_worker_scaling_policy() -> dict[str, int]:
+    payload = kubernetes_hpa_request("GET")
+    spec = payload.get("spec", {})
+    status = payload.get("status", {})
+    min_replicas = int(spec.get("minReplicas") or 1)
+    max_replicas = int(spec.get("maxReplicas") or worker_max_replicas())
+    desired = int(status.get("desiredReplicas") or min_replicas)
+    active = int(status.get("currentReplicas") or desired)
+    return {"replicas": active, "desired_replicas": desired, "min_replicas": min_replicas, "max_replicas": max_replicas}
+
+
+def apply_kubernetes_worker_bounds(min_replicas: int, max_replicas: int) -> dict[str, int]:
+    payload = kubernetes_hpa_request("PATCH", {"spec": {"minReplicas": min_replicas, "maxReplicas": max_replicas}})
+    spec = payload.get("spec", {})
+    status = payload.get("status", {})
+    current_min = int(spec.get("minReplicas") or min_replicas)
+    current_max = int(spec.get("maxReplicas") or max_replicas)
+    desired = int(status.get("desiredReplicas") or current_min)
+    active = int(status.get("currentReplicas") or desired)
+    return {"replicas": active, "desired_replicas": desired, "min_replicas": current_min, "max_replicas": current_max}
+
+
+def kubernetes_hpa_request(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    namespace = os.getenv("WORKER_K8S_NAMESPACE", os.getenv("POD_NAMESPACE", "norify"))
+    hpa = os.getenv("WORKER_K8S_HPA", os.getenv("WORKER_K8S_DEPLOYMENT", "sender-worker"))
+    host = os.getenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.getenv("KUBERNETES_SERVICE_PORT", "443")
+    url = f"https://{host}:{port}/apis/autoscaling/v2/namespaces/{namespace}/horizontalpodautoscalers/{hpa}"
+    token_path = os.getenv("KUBERNETES_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
+    ca_path = os.getenv("KUBERNETES_CA_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    with open(token_path, encoding="utf-8") as token_file:
+        token = token_file.read().strip()
+    body = None if payload is None else json.dumps(payload).encode()
+    content_type = "application/merge-patch+json" if method == "PATCH" else "application/json"
+    request = urllib.request.Request(url, data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": content_type}, method=method)
+    context = ssl.create_default_context(cafile=ca_path if os.path.exists(ca_path) else None)
+    with urllib.request.urlopen(request, timeout=10, context=context) as response:
+        raw = response.read()
+        return json.loads(raw.decode()) if raw else {}
 
 
 def proxy_json_sync(method: str, url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -409,7 +628,7 @@ async def worker_config(channel_code: str) -> dict[str, Any]:
 
 async def apply_message_event(payload: dict[str, Any]) -> None:
     campaign_id = payload["campaign_id"]
-    current = snapshots.get(campaign_id, ProgressSnapshot(campaign_id=campaign_id))
+    current = await read_campaign_snapshot(campaign_id)
     total = int(payload.get("total_messages") or campaign_totals.get(campaign_id, max(current.total_messages, current.processed + 1)))
     campaign_totals[campaign_id] = total
     key = event_key(payload)
@@ -431,7 +650,7 @@ async def apply_message_event(payload: dict[str, Any]) -> None:
         progress_percent=min(100, round(processed / total * 100, 2)) if total else 0,
         updated_at=datetime.now(timezone.utc),
     )
-    snapshots[campaign_id] = snapshot
+    await remember_campaign_snapshot(snapshot)
     await broadcast(campaign_id, snapshot.model_dump(mode="json"))
 
 
@@ -463,7 +682,7 @@ async def apply_worker_result_event(result: MessageSendResult) -> bool:
 
 async def apply_campaign_event(payload: dict[str, Any]) -> None:
     campaign_id = payload["campaign_id"]
-    current = snapshots.get(campaign_id, ProgressSnapshot(campaign_id=campaign_id))
+    current = await read_campaign_snapshot(campaign_id)
     total = int(payload.get("total_messages") or current.total_messages)
     processed = int(payload.get("processed") or current.processed)
     snapshot = ProgressSnapshot(
@@ -478,7 +697,7 @@ async def apply_campaign_event(payload: dict[str, Any]) -> None:
         progress_percent=min(100, round(processed / total * 100, 2)) if total else current.progress_percent,
         updated_at=datetime.now(timezone.utc),
     )
-    snapshots[campaign_id] = snapshot
+    await remember_campaign_snapshot(snapshot)
     if total > 0:
         campaign_totals[campaign_id] = total
     await broadcast(campaign_id, snapshot.model_dump(mode="json"))
@@ -519,6 +738,109 @@ async def read_channel_config_from_redis(channel_code: str) -> dict[str, Any] | 
     finally:
         await client.aclose()
     return json.loads(raw) if raw else None
+
+
+def campaign_snapshot_key(campaign_id: str) -> str:
+    return f"campaign-snapshot:{campaign_id}"
+
+
+async def redis_get_json(key: str) -> dict[str, Any] | None:
+    if not REDIS_URL or redis_async is None:
+        return None
+    client = redis_async.from_url(REDIS_URL, decode_responses=True)
+    try:
+        raw = await client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception as exc:
+        logger.warning("redis json get failed: %s", exc)
+        return None
+    finally:
+        await client.aclose()
+
+
+async def redis_set_json(key: str, value: dict[str, Any], ttl_seconds: int) -> None:
+    if not REDIS_URL or redis_async is None:
+        return
+    client = redis_async.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.setex(key, ttl_seconds, json.dumps(value, default=str))
+    except Exception as exc:
+        logger.warning("redis json set failed: %s", exc)
+    finally:
+        await client.aclose()
+
+
+async def redis_scan_json(match: str) -> list[dict[str, Any]]:
+    if not REDIS_URL or redis_async is None:
+        return []
+    client = redis_async.from_url(REDIS_URL, decode_responses=True)
+    try:
+        out: list[dict[str, Any]] = []
+        async for key in client.scan_iter(match):
+            raw = await client.get(key)
+            if raw:
+                out.append(json.loads(raw))
+        return out
+    except Exception as exc:
+        logger.warning("redis json scan failed: %s", exc)
+        return []
+    finally:
+        await client.aclose()
+
+
+async def read_campaign_snapshot(campaign_id: str) -> ProgressSnapshot:
+    current = snapshots.get(campaign_id)
+    cached = await redis_get_json(campaign_snapshot_key(campaign_id))
+    if cached:
+        snapshot = ProgressSnapshot.model_validate(cached)
+        if current is None or snapshot.updated_at >= current.updated_at:
+            snapshots[campaign_id] = snapshot
+            return snapshot
+    return current or ProgressSnapshot(campaign_id=campaign_id)
+
+
+async def remember_campaign_snapshot(snapshot: ProgressSnapshot) -> None:
+    snapshots[snapshot.campaign_id] = snapshot
+    await redis_set_json(campaign_snapshot_key(snapshot.campaign_id), snapshot.model_dump(mode="json"), CAMPAIGN_SNAPSHOT_TTL_SECONDS)
+
+
+async def list_campaign_snapshots() -> list[ProgressSnapshot]:
+    merged = dict(snapshots)
+    for cached in await redis_scan_json("campaign-snapshot:*"):
+        snapshot = ProgressSnapshot.model_validate(cached)
+        current = merged.get(snapshot.campaign_id)
+        if current is None or snapshot.updated_at >= current.updated_at:
+            merged[snapshot.campaign_id] = snapshot
+    return list(merged.values())
+
+
+async def read_worker_scaling_policy_from_redis() -> dict[str, int] | None:
+    cached = await redis_get_json(WORKER_POLICY_KEY)
+    if not cached:
+        return None
+    try:
+        return normalize_worker_scaling_policy(cached)
+    except Exception as exc:
+        logger.warning("redis worker policy invalid: %s", exc)
+        return None
+
+
+async def write_worker_scaling_policy_to_redis(policy: dict[str, int]) -> None:
+    await redis_set_json(WORKER_POLICY_KEY, policy, WORKER_POLICY_TTL_SECONDS)
+
+
+def normalize_worker_scaling_policy(raw: dict[str, Any]) -> dict[str, int]:
+    min_replicas = max(1, int(raw.get("min_replicas") or 1))
+    max_replicas = max(min_replicas, int(raw.get("max_replicas") or worker_max_replicas()))
+    desired = max(min_replicas, min(int(raw.get("desired_replicas") or min_replicas), max_replicas))
+    replicas = max(1, int(raw.get("replicas") or desired))
+    return {"replicas": replicas, "desired_replicas": desired, "min_replicas": min_replicas, "max_replicas": max_replicas}
+
+
+async def maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 async def write_channel_config_to_redis(channel_code: str, config: dict[str, Any]) -> None:

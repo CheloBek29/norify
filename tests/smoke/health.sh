@@ -16,5 +16,5 @@ check campaign-service http://localhost:8085/health/live
 check dispatcher-service http://localhost:8086/health/live
 check sender-worker http://localhost:8087/health/live
 check notification-error-service http://localhost:8088/health/live
-check status-service http://localhost:8090/health/live
-
+check ops-gateway http://localhost:8090/health/live
+check stats-service http://localhost:8092/health/live

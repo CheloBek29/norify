@@ -17,14 +17,20 @@ type CampaignProgressEvent struct {
 }
 
 type CampaignDispatchRequest struct {
-	CampaignID       string   `json:"campaign_id"`
-	TemplateID       string   `json:"template_id"`
-	MessageBody      string   `json:"message_body"`
-	TotalRecipients  int      `json:"total_recipients"`
-	SelectedChannels []string `json:"selected_channels"`
-	BatchSize        int      `json:"batch_size"`
-	StartRecipient   int      `json:"start_recipient,omitempty"`
-	RequestedAt      string   `json:"requested_at"`
+	CampaignID         string              `json:"campaign_id"`
+	TemplateID         string              `json:"template_id"`
+	MessageBody        string              `json:"message_body"`
+	TotalRecipients    int                 `json:"total_recipients"`
+	SelectedChannels   []string            `json:"selected_channels"`
+	SpecificRecipients []CampaignRecipient `json:"specific_recipients,omitempty"`
+	BatchSize          int                 `json:"batch_size"`
+	StartRecipient     int                 `json:"start_recipient,omitempty"`
+	RequestedAt        string              `json:"requested_at"`
+}
+
+type CampaignRecipient struct {
+	UserID   string   `json:"user_id"`
+	Channels []string `json:"channels"`
 }
 
 type CampaignDispatchMetrics struct {
