@@ -93,6 +93,7 @@ export function App() {
   const [statsState, setStatsState] = useState("stats connecting");
   const [selectedCampaignId, setSelectedCampaignId] = useState(campaigns[0]?.id ?? "");
   const [apiState, setApiState] = useState("connecting");
+  const [opsConnected, setOpsConnected] = useState(false);
   const [pendingActionKeys, setPendingActionKeys] = useState<string[]>([]);
   const [createPending, setCreatePending] = useState(false);
   const opsSocketRef = useRef<WebSocket | null>(null);
@@ -102,6 +103,7 @@ export function App() {
   const selectedCampaign = activeCampaigns.find((campaign) => campaign.id === selectedCampaignId) ?? activeCampaigns[0] ?? campaigns[0];
   const activeError = selectedCampaign ? buildError(selectedCampaign) : emptyActionableError();
   const backendAvailable = healthChecks.some((check) => check.status === "ready");
+  const commandsAvailable = opsConnected;
 
   useEffect(() => {
     const path = pathForScreen(screen);
@@ -133,7 +135,7 @@ export function App() {
 
   useEffect(() => {
     if (!backendAvailable) return;
-    setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+    setApiState((current) => current === "connecting" || current === "backend offline" ? "live backend" : current);
   }, [backendAvailable]);
 
   useEffect(() => {
@@ -145,7 +147,7 @@ export function App() {
         if (closed) return;
         setStatsSnapshot(snapshot);
         setStatsState("stats snapshot");
-        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+        setApiState((current) => current === "connecting" || current === "backend offline" ? "live backend" : current);
       })
       .catch(() => {
         if (!closed) setStatsState("stats unavailable");
@@ -160,7 +162,7 @@ export function App() {
         if (closed) return;
         setStatsSnapshot(normalizeStatsSnapshot(JSON.parse(event.data) as Record<string, unknown>));
         setStatsState("stats live");
-        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+        setApiState((current) => current === "connecting" || current === "backend offline" ? "live backend" : current);
       } catch (error) {
         console.error("stats stream parse error:", error);
       }
@@ -170,7 +172,7 @@ export function App() {
     stream.onopen = () => {
       if (!closed) {
         setStatsState("stats live");
-        setApiState((current) => current === "connecting" || current === "local fallback" ? "live backend" : current);
+        setApiState((current) => current === "connecting" || current === "backend offline" ? "live backend" : current);
       }
     };
     stream.onerror = () => {
@@ -202,7 +204,7 @@ export function App() {
     if (hasLiveData) {
       setApiState("live backend");
     } else {
-      setApiState("local fallback");
+      setApiState("backend offline");
     }
     const idToFetch = activeCampaignId || (nextCampaigns.status === "fulfilled" && nextCampaigns.value[0]?.id) || "";
     if (idToFetch) {
@@ -220,7 +222,10 @@ export function App() {
       if (stopped) return;
       const socket = new WebSocket(operationsWebSocketURL());
       opsSocketRef.current = socket;
-      socket.onopen = () => setApiState("websocket commands");
+      socket.onopen = () => {
+        setOpsConnected(true);
+        setApiState("websocket commands");
+      };
       socket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as Record<string, unknown>;
@@ -238,6 +243,7 @@ export function App() {
       };
       socket.onclose = () => {
         if (opsSocketRef.current === socket) opsSocketRef.current = null;
+        setOpsConnected(false);
         setApiState((current) => current === "websocket commands" ? "websocket reconnecting" : current);
         if (!stopped) window.setTimeout(connect, 2000);
       };
@@ -250,6 +256,7 @@ export function App() {
       if (socket) {
         socket.close();
         opsSocketRef.current = null;
+        setOpsConnected(false);
       }
     };
   }, [session]);
@@ -275,7 +282,7 @@ export function App() {
           console.error("campaign ws parse error:", err);
         }
       };
-      socket.onopen = () => setApiState("websocket live");
+      socket.onopen = () => undefined;
       return socket;
     });
     return () => {
@@ -285,8 +292,8 @@ export function App() {
   }, [session, campaigns.map((campaign) => campaign.id).sort().join("|")]);
 
   useEffect(() => {
-    if (apiState !== "local fallback") return;
-    addEvent("warn", "frontend.local_fallback", "Backend недоступен: локальные демо-данные не являются доказательством доставки.", "frontend");
+    if (apiState !== "backend offline") return;
+    addEvent("warn", "frontend.backend_offline", "Backend недоступен: действия заблокированы до восстановления соединения.", "frontend");
   }, [apiState, setCampaigns]);
 
   if (!session) {
@@ -392,7 +399,10 @@ export function App() {
   }
 
   async function createCampaign(wizard: WizardState) {
-    if (createPending) return;
+    if (createPending || !commandsAvailable) {
+      if (!commandsAvailable) addEvent("error", "campaign.create.blocked", "Backend command channel is offline", "frontend");
+      return;
+    }
     setCreatePending(true);
     const template = templates.find((item) => item.id === wizard.templateId) ?? templates[0];
     const totalRecipients = wizard.specificUsers?.length ? wizard.specificUsers.length : audiencePreview(wizard.filter);
@@ -418,7 +428,7 @@ export function App() {
       addEvent("info", "campaign.started", `Campaign ${backendCampaign.name} queued with ${totalMessages.toLocaleString()} messages`, "campaign-service");
       return;
     } catch (error) {
-      setApiState("local fallback");
+      setApiState("backend offline");
       const message = error instanceof Error ? error.message : "backend_unavailable";
       addEvent("error", "campaign.create_failed", `Campaign was not created in backend: ${message}`, "campaign-service");
     } finally {
@@ -427,6 +437,10 @@ export function App() {
   }
 
   function updateTemplate(template: Template) {
+    if (!commandsAvailable) {
+      addEvent("error", "template.save.blocked", "Backend command channel is offline", "frontend");
+      return;
+    }
     setTemplates((items) => {
       const exists = items.some((item) => item.id === template.id);
       if (exists) return items.map((item) => (item.id === template.id ? template : item));
@@ -438,6 +452,10 @@ export function App() {
 
   function updateChannel(code: string, patch: Partial<Channel>) {
     if (userSession.role !== "admin") return;
+    if (!commandsAvailable) {
+      addEvent("error", "channel.update.blocked", "Backend command channel is offline", "frontend");
+      return;
+    }
     const current = channels.find((channel) => channel.code === code);
     const updated = current ? { ...current, ...patch } : patch;
     setChannels((items) => items.map((channel) => (channel.code === code ? { ...channel, ...patch } : channel)));
@@ -447,6 +465,10 @@ export function App() {
 
   function addManager(email: string, role: Role) {
     if (userSession.role !== "admin" || !email.includes("@")) return;
+    if (!commandsAvailable) {
+      addEvent("error", "manager.add.blocked", "Backend command channel is offline", "frontend");
+      return;
+    }
     setManagers((items) => [{ id: id("manager"), email, role, active: true }, ...items]);
     void sendOpsCommand("manager.add", { email, role }).catch(() => undefined);
     addEvent("info", "manager.created", `${email} added as ${role}`, "auth-service");
@@ -455,6 +477,10 @@ export function App() {
   async function handleCampaignAction(action: CampaignCommand, campaignId = selectedCampaign?.id) {
     const targetCampaign = campaigns.find((campaign) => campaign.id === campaignId);
     if (!targetCampaign) return;
+    if (!commandsAvailable) {
+      addEvent("error", `campaign.${action}.blocked`, `${targetCampaign.name}: backend command channel is offline`, "frontend");
+      return;
+    }
     const key = campaignActionKey(targetCampaign.id, action);
     await runPendingAction(key, async () => {
       try {
@@ -473,7 +499,7 @@ export function App() {
         setApiState("websocket commands");
         addEvent("info", `campaign.${action}`, `${targetCampaign.name}: backend confirmed ${action}`, "campaign-service");
       } catch (error) {
-        setApiState("local fallback");
+        setApiState("backend offline");
         const message = error instanceof Error ? error.message : "command_failed";
         addEvent("error", `campaign.${action}.failed`, `${targetCampaign.name}: backend did not apply ${action} (${message})`, "campaign-service");
       }
@@ -482,6 +508,10 @@ export function App() {
 
   async function handleErrorGroupAction(group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) {
     if (!selectedCampaign) return;
+    if (!commandsAvailable) {
+      addEvent("error", `error_group.${action}.blocked`, `${group.channelCode}/${group.errorCode}: backend command channel is offline`, "frontend");
+      return;
+    }
     const targetChannel = toChannel ?? channels.find((channel) => channel.enabled && channel.code !== group.channelCode)?.code ?? "";
     const key = errorGroupActionKey(group.id, action);
     await runPendingAction(key, async () => {
@@ -500,7 +530,7 @@ export function App() {
         setApiState("websocket commands");
         addEvent("info", `error_group.${action}`, `${group.channelCode}/${group.errorCode}: backend confirmed group action`, "campaign-service");
       } catch (error) {
-        setApiState("local fallback");
+        setApiState("backend offline");
         const message = error instanceof Error ? error.message : "command_failed";
         addEvent("error", `error_group.${action}.failed`, `${group.channelCode}/${group.errorCode}: backend did not apply action (${message})`, "campaign-service");
       }
@@ -561,9 +591,9 @@ export function App() {
             <button className="primary" onClick={() => setScreen("create")}><Icon name="plus" /> Новая кампания</button>
           </div>
         </header>
-        {apiState === "local fallback" && !backendAvailable && (
+        {apiState === "backend offline" && !commandsAvailable && (
           <div className="fallbackBanner" role="alert">
-            Backend недоступен. Локальные демо-данные не считаются реальной доставкой; новые кампании и повторные действия не применяются без подтверждения backend.
+            Backend недоступен. Действия заблокированы до восстановления соединения; локальные демо-данные не считаются реальной доставкой.
           </div>
         )}
 
@@ -576,10 +606,11 @@ export function App() {
             onAction={handleCampaignAction}
             onGroupAction={handleErrorGroupAction}
             pendingActionKeys={pendingActionKeys}
+            commandsAvailable={commandsAvailable}
           />
         )}
-        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} pendingActionKeys={pendingActionKeys} />}
-        {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} pending={createPending} />}
+        {screen === "campaigns" && <CampaignList campaigns={campaigns} selectedId={selectedCampaign?.id} onSelect={(id) => setSelectedCampaignId(id)} onAction={(campaignId, action) => handleCampaignAction(action, campaignId)} pendingActionKeys={pendingActionKeys} commandsAvailable={commandsAvailable} />}
+        {screen === "create" && <CreateCampaign templates={templates} channels={channels} onCreate={createCampaign} pending={createPending} commandsAvailable={commandsAvailable} />}
         {screen === "templates" && <Templates templates={templates} variableOptions={templateVariables} onSave={updateTemplate} />}
         {screen === "channels" && <Channels channels={channels} role={userSession.role} onUpdate={updateChannel} />}
         {screen === "deliveries" && <Deliveries deliveries={deliveries} campaigns={campaigns} />}
@@ -778,6 +809,7 @@ function Dashboard({
   onAction,
   onGroupAction,
   pendingActionKeys,
+  commandsAvailable,
 }: {
   campaign: Campaign;
   channels: Channel[];
@@ -786,6 +818,7 @@ function Dashboard({
   onAction: (action: CampaignCommand) => void;
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
   pendingActionKeys: string[];
+  commandsAvailable: boolean;
 }) {
   const percent = progressPercent(campaign);
   const totalMessages = effectiveTotalMessages(campaign);
@@ -801,10 +834,10 @@ function Dashboard({
           </div>
         </div>
         <div className="campaignControlBar">
-          <CampaignPlayerControls campaign={campaign} onAction={onAction} pendingActionKeys={pendingActionKeys} />
+          <CampaignPlayerControls campaign={campaign} onAction={onAction} pendingActionKeys={pendingActionKeys} commandsAvailable={commandsAvailable} />
           {campaign.failed > 0 && (
             <div className="recoveryActions" aria-label="Campaign recovery actions">
-              <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
+              <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> Повторить ошибки</button>
               <span className="inlineNotice">Смена канала для всей кампании отключена: используйте группы ошибок.</span>
             </div>
           )}
@@ -854,12 +887,13 @@ function Dashboard({
         onAction={onAction}
         onGroupAction={onGroupAction}
         pendingActionKeys={pendingActionKeys}
+        commandsAvailable={commandsAvailable}
       />
     </div>
   );
 }
 
-function CampaignPlayerControls({ campaign, onAction, pendingActionKeys }: { campaign: Campaign; onAction: (action: CampaignCommand) => void; pendingActionKeys: string[] }) {
+function CampaignPlayerControls({ campaign, onAction, pendingActionKeys, commandsAvailable }: { campaign: Campaign; onAction: (action: CampaignCommand) => void; pendingActionKeys: string[]; commandsAvailable: boolean }) {
   const isRunning = campaign.status === "running" || campaign.status === "retrying";
   const isComplete = campaign.status === "cancelled" || campaign.status === "finished";
   const canStart = campaign.status === "created" || campaign.status === "stopped";
@@ -870,13 +904,13 @@ function CampaignPlayerControls({ campaign, onAction, pendingActionKeys }: { cam
 
   return (
     <div className="transportControls" aria-label="Campaign player controls">
-      <button className="primary" disabled={!canStart || startPending} onClick={() => onAction("start")}>
+      <button className="primary" disabled={!commandsAvailable || !canStart || startPending} onClick={() => onAction("start")}>
         <Icon name="play" /> {startLabel}
       </button>
-      <button disabled={!isRunning || stopPending} onClick={() => onAction("stop")}>
+      <button disabled={!commandsAvailable || !isRunning || stopPending} onClick={() => onAction("stop")}>
         <Icon name="stop" /> Остановить
       </button>
-      <button className="danger" disabled={isComplete || cancelPending} onClick={() => onAction("cancel_campaign")}>
+      <button className="danger" disabled={!commandsAvailable || isComplete || cancelPending} onClick={() => onAction("cancel_campaign")}>
         <Icon name="cancel" /> Отменить
       </button>
     </div>
@@ -891,6 +925,7 @@ function ErrorGroupsPanel({
   onAction,
   onGroupAction,
   pendingActionKeys,
+  commandsAvailable,
 }: {
   campaign: Campaign;
   channels: Channel[];
@@ -899,6 +934,7 @@ function ErrorGroupsPanel({
   onAction: (action: CampaignCommand) => void;
   onGroupAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
   pendingActionKeys: string[];
+  commandsAvailable: boolean;
 }) {
   return (
     <section className="panel errorGroupsPanel" aria-label="Группы ошибок">
@@ -908,7 +944,7 @@ function ErrorGroupsPanel({
       {groups.length > 0 ? (
         <>
           <div className="errorGroups">
-            {groups.map((group) => <ErrorGroupCard key={group.id} group={group} channels={channels} onAction={onGroupAction} pendingActionKeys={pendingActionKeys} />)}
+            {groups.map((group) => <ErrorGroupCard key={group.id} group={group} channels={channels} onAction={onGroupAction} pendingActionKeys={pendingActionKeys} commandsAvailable={commandsAvailable} />)}
           </div>
         </>
       ) : (
@@ -917,9 +953,9 @@ function ErrorGroupsPanel({
           <span>Основная отправка продолжается. Новые сбои появятся здесь отдельными группами для точечного решения.</span>
           {campaign.failed > 0 && (
             <div className="buttonRow">
-              <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
+              <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction("retry")}><Icon name="retry" /> {error.actions[0].label}</button>
               <span className="inlineNotice">Смена канала для всей кампании отключена: требуется точная маршрутизация по конкретным ошибочным доставкам.</span>
-              <button className="danger" disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
+              <button className="danger" disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction("cancel_campaign")}><Icon name="stop" /> {error.actions[2].label}</button>
             </div>
           )}
         </div>
@@ -933,11 +969,13 @@ function ErrorGroupCard({
   channels,
   onAction,
   pendingActionKeys,
+  commandsAvailable,
 }: {
   group: ErrorGroup;
   channels: Channel[];
   onAction: (group: ErrorGroup, action: "retry" | "switch_channel" | "cancel_group", toChannel?: string) => void;
   pendingActionKeys: string[];
+  commandsAvailable: boolean;
 }) {
   const alternativeChannels = channels.filter((channel) => channel.enabled && channel.code !== group.channelCode);
   const [selectedChannel, setSelectedChannel] = useState(preferredFallbackChannel(alternativeChannels));
@@ -959,7 +997,7 @@ function ErrorGroupCard({
 
   function handleChannelSelect(nextChannel: string) {
     setSelectedChannel(nextChannel);
-    if (!nextChannel || nextChannel === selectedChannel || switchPending) return;
+    if (!commandsAvailable || !nextChannel || nextChannel === selectedChannel || switchPending) return;
     onAction(group, "switch_channel", nextChannel);
   }
 
@@ -976,20 +1014,20 @@ function ErrorGroupCard({
       <div className="groupImpact">{group.impact}</div>
       <div className="groupActions">
         {hasAction("retry") && (
-          <button disabled={retryPending} onClick={() => onAction(group, "retry")}>
+          <button disabled={!commandsAvailable || retryPending} onClick={() => onAction(group, "retry")}>
             Повторить
           </button>
         )}
         {hasAction("switch_channel") && (
           <label className="switchChannelAction">
             <span className="srOnly">Альтернативный канал</span>
-            <select aria-label="Альтернативный канал" value={selectedChannel} disabled={!selectedChannel || switchPending} onChange={(event) => handleChannelSelect(event.target.value)}>
+            <select aria-label="Альтернативный канал" value={selectedChannel} disabled={!commandsAvailable || !selectedChannel || switchPending} onChange={(event) => handleChannelSelect(event.target.value)}>
               {alternativeChannels.map((channel) => <option key={channel.code} value={channel.code}>{formatChannelName(channel.code, channel.name)}</option>)}
             </select>
           </label>
         )}
         {hasAction("cancel_group") && (
-          <button className="danger" disabled={cancelPending} onClick={() => onAction(group, "cancel_group")}>
+          <button className="danger" disabled={!commandsAvailable || cancelPending} onClick={() => onAction(group, "cancel_group")}>
             Закрыть
           </button>
         )}
@@ -1012,7 +1050,7 @@ function errorCodeLabel(code: string) {
   return code ? `Код ошибки: ${code}` : "Ошибка доставки без сообщения адаптера";
 }
 
-function CampaignList({ campaigns, selectedId, onSelect, onAction, pendingActionKeys }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void; pendingActionKeys: string[] }) {
+function CampaignList({ campaigns, selectedId, onSelect, onAction, pendingActionKeys, commandsAvailable }: { campaigns: Campaign[]; selectedId?: string; onSelect: (id: string) => void; onAction: (campaignId: string, action: "start" | "retry" | "cancel_campaign" | "archive") => void; pendingActionKeys: string[]; commandsAvailable: boolean }) {
   const [showArchive, setShowArchive] = useState(false);
   const activeCampaigns = campaigns.filter((campaign) => !campaign.archivedAt);
   const archivedCampaigns = campaigns.filter((campaign) => campaign.archivedAt);
@@ -1045,10 +1083,10 @@ function CampaignList({ campaigns, selectedId, onSelect, onAction, pendingAction
                 <td>{campaign.totalMessages.toLocaleString()}</td>
                 <td>{formatP95Dispatch(campaign)}</td>
                 <td className="tableActions">
-                  {!campaign.archivedAt && campaign.status === "created" && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "start"))} onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Старт</button>}
-                  {!campaign.archivedAt && campaign.failed > 0 && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Повторить</button>}
-                  {!campaign.archivedAt && (campaign.status === "running" || campaign.status === "retrying") && <button className="danger" disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Отменить</button>}
-                  {!campaign.archivedAt && campaign.status !== "created" && <button disabled={pendingActionKeys.includes(campaignActionKey(campaign.id, "archive"))} onClick={() => onAction(campaign.id, "archive")}><Icon name="archive" /> В архив</button>}
+                  {!campaign.archivedAt && campaign.status === "created" && <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "start"))} onClick={() => onAction(campaign.id, "start")}><Icon name="play" /> Старт</button>}
+                  {!campaign.archivedAt && campaign.failed > 0 && <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "retry"))} onClick={() => onAction(campaign.id, "retry")}><Icon name="retry" /> Повторить</button>}
+                  {!campaign.archivedAt && (campaign.status === "running" || campaign.status === "retrying") && <button className="danger" disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "cancel_campaign"))} onClick={() => onAction(campaign.id, "cancel_campaign")}><Icon name="stop" /> Отменить</button>}
+                  {!campaign.archivedAt && campaign.status !== "created" && <button disabled={!commandsAvailable || pendingActionKeys.includes(campaignActionKey(campaign.id, "archive"))} onClick={() => onAction(campaign.id, "archive")}><Icon name="archive" /> В архив</button>}
                 </td>
               </tr>
             ))}
@@ -1309,7 +1347,7 @@ function UserPickerModal({ availableChannels, initialSelection, onClose, onConfi
   );
 }
 
-function CreateCampaign({ templates, channels, onCreate, pending }: { templates: Template[]; channels: Channel[]; onCreate: (wizard: WizardState) => void | Promise<void>; pending: boolean }) {
+function CreateCampaign({ templates, channels, onCreate, pending, commandsAvailable }: { templates: Template[]; channels: Channel[]; onCreate: (wizard: WizardState) => void | Promise<void>; pending: boolean; commandsAvailable: boolean }) {
   const enabledChannels = channels.filter((channel) => channel.enabled);
   const [wizard, setWizard] = useState<WizardState>({
     name: "Новая кампания",
@@ -1324,7 +1362,7 @@ function CreateCampaign({ templates, channels, onCreate, pending }: { templates:
   const totalMessages = isSpecific
     ? preview * wizard.selectedChannels.length
     : preview * wizard.selectedChannels.length;
-  const canStart = wizard.name.trim().length > 2 && Boolean(wizard.templateId) && wizard.selectedChannels.length > 0 && !pending;
+  const canStart = commandsAvailable && wizard.name.trim().length > 2 && Boolean(wizard.templateId) && wizard.selectedChannels.length > 0 && !pending;
 
   function toggleChannel(code: string) {
     setWizard((current) => {

@@ -318,22 +318,19 @@ export function effectiveTotalMessages(campaign: Campaign): number {
   return campaign.totalRecipients * campaign.selectedChannels.length;
 }
 
-const useFrontendProxy = import.meta.env.PROD;
+export const serviceBase = (service: string) => `/api/${service}`;
 
-const serviceBase = (service: string, localPort: number) =>
-  useFrontendProxy ? `/api/${service}` : `http://localhost:${localPort}`;
-
-const api = {
-  auth: serviceBase("auth-service", 8081),
-  users: serviceBase("user-service", 8082),
-  templates: serviceBase("template-service", 8083),
-  channels: serviceBase("channel-service", 8084),
-  campaigns: serviceBase("campaign-service", 8085),
-  dispatcher: serviceBase("dispatcher-service", 8086),
-  sender: serviceBase("sender-worker", 8087),
-  errors: serviceBase("notification-error-service", 8088),
-  ops: serviceBase("ops-gateway", 8090),
-  stats: serviceBase("stats-service", 8092),
+export const api = {
+  auth: serviceBase("auth-service"),
+  users: serviceBase("user-service"),
+  templates: serviceBase("template-service"),
+  channels: serviceBase("channel-service"),
+  campaigns: serviceBase("campaign-service"),
+  dispatcher: serviceBase("dispatcher-service"),
+  sender: serviceBase("sender-worker"),
+  errors: serviceBase("notification-error-service"),
+  ops: serviceBase("ops-gateway"),
+  stats: serviceBase("stats-service"),
 };
 
 export const serviceHealthTargets = [

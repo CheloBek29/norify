@@ -229,6 +229,43 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Новая кампания/i })).toBeTruthy();
   });
 
+  it("marks backend offline and disables state-changing actions when ops websocket is unavailable", async () => {
+    class ClosedWebSocket {
+      static instances: ClosedWebSocket[] = [];
+      onopen: null | (() => void) = null;
+      onmessage: null | ((event: { data: string }) => void) = null;
+      onclose: null | (() => void) = null;
+      readyState = 3;
+      sent: string[] = [];
+      url: string;
+
+      constructor(url: string) {
+        this.url = url;
+        ClosedWebSocket.instances.push(this);
+        window.setTimeout(() => this.onclose?.(), 0);
+      }
+
+      send(data: string) {
+        this.sent.push(data);
+      }
+
+      close() {
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal("WebSocket", ClosedWebSocket);
+
+    render(<App />);
+    login();
+
+    expect(await screen.findByText("backend offline")).toBeTruthy();
+    expect(screen.queryByText("local fallback")).toBeNull();
+    expect((await screen.findByRole("button", { name: /Повторить ошибки/i }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Кампании" }));
+    expect(((await screen.findAllByRole("button", { name: /Отменить/i }))[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("keeps the current screen after a browser refresh", async () => {
     const { unmount } = render(<App />);
     login();
